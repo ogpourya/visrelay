@@ -24,8 +24,12 @@ uv tool install https://github.com/ogpourya/visrelay.git
 
 ```sh
 visrelay
-visrelay --host 0.0.0.0 --port 29173 --fps 15
+visrelay --host 0.0.0.0 --port 29173 --fps 24
 visrelay --demo
 ```
 
 Open `http://<host>:29173/`.
+
+## Known limitations
+
+Fullscreen games or maximized windows can freeze the stream: the compositor stops sending frames and there is nothing to relay (OBS has the same wall). Un-maximizing usually resumes it. A permanently dead feed exits with `○ Capture stalled.` instead of freezing forever.
