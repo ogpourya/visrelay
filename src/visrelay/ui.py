@@ -133,6 +133,10 @@ def sharing_stopped() -> None:
     print(f"{yellow('○')} Sharing stopped.", flush=True)
 
 
+def stalled() -> None:
+    print(f"{yellow('○')} Capture stalled.", flush=True)
+
+
 class Spinner:
     """Inline Braille spinner for the portal wait. No-op when piped."""
 

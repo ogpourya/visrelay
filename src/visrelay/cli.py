@@ -11,6 +11,7 @@ import asyncio
 import os
 import socket
 import sys
+import threading
 import time
 
 from . import _compat as _compat_shim  # noqa: F401  (typing shim for dbus-next on 3.15+)
@@ -238,11 +239,22 @@ def main(argv: list[str] | None = None) -> int:
     from .server import serve_forever
 
     _ui.ready(_display_host(args.host), args.port)
+
+    def _stall_watch() -> None:
+        while not store.is_closed():
+            time.sleep(1.0)
+            try:
+                if store.stalled(12.0, args.idle_timeout):
+                    store.close("capture stalled")
+                    break
+            except Exception:
+                break
+
+    threading.Thread(target=_stall_watch, name="visrelay-stall-watch", daemon=True).start()
     stop_when = None if is_demo else store.is_closed
-    reason = "ok"
     try:
-        reason = serve_forever(store, host=args.host, port=args.port, fps=args.fps,
-                               verbose=args.verbose, stop_when=stop_when)
+        serve_forever(store, host=args.host, port=args.port, fps=args.fps,
+                      verbose=args.verbose, stop_when=stop_when)
     except KeyboardInterrupt:
         _ui.stopped()
     except OSError as e:
@@ -264,8 +276,11 @@ def main(argv: list[str] | None = None) -> int:
             cleanup()
         # Allow server threads to drain.
         time.sleep(0.1)
-    if reason == "portal-closed" or (not is_demo and store.is_closed()):
-        _ui.sharing_stopped()
+    if store.is_closed():
+        if store.close_reason == "capture stalled":
+            _ui.stalled()
+        else:
+            _ui.sharing_stopped()
     return 0
 
 

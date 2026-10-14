@@ -68,8 +68,16 @@ class _Handler(BaseHTTPRequestHandler):
             import socket as _socket
 
             self.request.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+            # Don't let a stalled background-tab connection hold a thread forever.
+            self.request.settimeout(20.0)
         except Exception:
             pass
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except TimeoutError:
+            self.close_connection = True
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: ANN001, ANN002
         if self.verbose:
@@ -90,7 +98,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD" and body:
             try:
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
 
     def do_GET(self) -> None:  # noqa: N802
@@ -161,7 +169,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Connection", "close")
             self.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
 
         wfile = self.wfile
@@ -197,7 +205,7 @@ class _Handler(BaseHTTPRequestHandler):
                     write(jpeg)
                     write(CRLF)
                     flush()
-                except (BrokenPipeError, ConnectionResetError, ValueError):
+                except (BrokenPipeError, ConnectionResetError, ValueError, TimeoutError):
                     break
         finally:
             try:
@@ -253,6 +261,8 @@ def build_index(*, port: int, fps: float, width: int = 0, height: int = 0) -> by
         "img.onerror=()=>{dot.style.background='#f87171';dot.style.boxShadow='none';"
         "n++;setTimeout(()=>{img.src='/stream.mjpg?r='+Date.now()},Math.min(1000*n,5000))};"
         "img.onclick=()=>{document.fullscreenElement?document.exitFullscreen():img.requestFullscreen()};"
+        "document.addEventListener('visibilitychange',()=>{"
+        "if(!document.hidden){img.src='/stream.mjpg?r='+Date.now()}});"
         "</script></body></html>"
     ).encode("utf-8")
 

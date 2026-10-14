@@ -87,10 +87,32 @@ class FrameStore:
                 return False
             return (time.monotonic() - self._last_viewer_ts) < idle_timeout
 
+    def stalled(self, publish_timeout: float, idle_timeout: float) -> bool:
+        """True if capture is demanded but no frame was published lately.
+
+        Never fires while idle-paused (no demand) or before the first
+        frame: those are normal states, not stalls.
+        """
+        with self._lock:
+            if self._closed or self._frame_id == 0:
+                return False
+            if self._viewers > 0:
+                demand = True
+            elif self._last_viewer_ts == 0.0:
+                return False
+            else:
+                demand = (time.monotonic() - self._last_viewer_ts) < idle_timeout
+            if not demand:
+                return False
+            return (time.monotonic() - self._timestamp) > publish_timeout
+
     def wait_for(self, last_id: int, timeout: float = 5.0) -> tuple[bytes | None, int, float]:
         """Block until a frame newer than last_id arrives, closes, or timeout."""
         with self._condition:
             if self._frame_id != last_id and self._jpeg is not None:
                 return self._jpeg, self._frame_id, self._timestamp
-            self._condition.wait_for(lambda: self._frame_id != last_id or self._closed, timeout=timeout)
+            self._condition.wait_for(
+                lambda: (self._frame_id != last_id and self._jpeg is not None) or self._closed,
+                timeout=timeout,
+            )
             return self._jpeg, self._frame_id, self._timestamp

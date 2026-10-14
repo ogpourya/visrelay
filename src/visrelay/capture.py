@@ -16,6 +16,13 @@ import simplejpeg
 from .frames import FrameStore
 
 
+# Feed-stall detection: a healthy PipeWire feed delivers a first frame
+# quickly and never goes silent (None) for long while demanded. Static
+# screens still deliver repeat frames, so these can't false-positive.
+NONE_STALL_S = 10.0
+FIRST_FRAME_S = 15.0
+
+
 def encode_frame(frame: np.ndarray, quality: int) -> bytes:
     channels = frame.shape[2] if frame.ndim == 3 else 4
     colorspace = "RGB" if channels == 3 else "BGRA"
@@ -58,6 +65,7 @@ class CaptureWorker(threading.Thread):
         self.errors = 0
         self.ended = threading.Event()
         self.abrupt = False
+        self.stalled = False
         self._idle_timeout = idle_timeout
 
     def stop(self) -> None:
@@ -66,11 +74,14 @@ class CaptureWorker(threading.Thread):
     def run(self) -> None:
         stream = self._stream
         abrupt = False
+        stall = False
         try:
             # Wait briefly for the first buffer (mirrors main.py behaviour).
             frame = None
+            no_frame_since: float | None = None
             while frame is None and not self._stop.is_set():
                 if not self._store.wants_capture(self._idle_timeout):
+                    no_frame_since = None
                     if getattr(stream, "window_invalid", False):
                         abrupt = True
                         break
@@ -86,15 +97,23 @@ class CaptureWorker(threading.Thread):
                     abrupt = True
                     break
                 if frame is None:
+                    if no_frame_since is None:
+                        no_frame_since = time.monotonic()
+                    elif time.monotonic() - no_frame_since > FIRST_FRAME_S:
+                        stall = True
+                        break
                     time.sleep(0.005)
+                else:
+                    no_frame_since = None
 
-            if abrupt:
-                self._store.close("sharing stopped")
+            if abrupt or stall:
                 return
 
             last_frame = frame
+            none_since: float | None = None
             while not self._stop.is_set():
                 if not self._store.wants_capture(self._idle_timeout):
+                    none_since = None
                     if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
                         abrupt = True
                         break
@@ -113,7 +132,14 @@ class CaptureWorker(threading.Thread):
                     self.errors += 1
                     abrupt = True
                     break
-                if latest is not None:
+                if latest is None:
+                    if none_since is None:
+                        none_since = time.monotonic()
+                    elif time.monotonic() - none_since > NONE_STALL_S:
+                        stall = True
+                        break
+                else:
+                    none_since = None
                     last_frame = latest
                 if last_frame is None:
                     time.sleep(0.005)
@@ -135,9 +161,13 @@ class CaptureWorker(threading.Thread):
                     # Wake early on stop().
                     self._stop.wait(sleep_time)
         finally:
-            if abrupt and not self._stop.is_set():
-                self.abrupt = True
-                self._store.close("sharing stopped")
+            if not self._stop.is_set():
+                if abrupt:
+                    self.abrupt = True
+                    self._store.close("sharing stopped")
+                elif stall:
+                    self.stalled = True
+                    self._store.close("capture stalled")
             self.ended.set()
 
 
