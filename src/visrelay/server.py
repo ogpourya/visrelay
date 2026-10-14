@@ -124,35 +124,51 @@ class _Handler(BaseHTTPRequestHandler):
     # -- hot paths ------------------------------------------------------
     def _handle_snapshot(self) -> None:
         store = self.server.state_store  # type: ignore[attr-defined]
-        jpeg, _, _ = store.snapshot()
-        # Wait briefly (not busy-loop) if encoder hasn't produced a frame yet.
-        if jpeg is None:
-            jpeg, _, _ = store.wait_for(-1, timeout=5.0)
-        if jpeg is None:
-            self._send(503, "text/plain; charset=utf-8", b"no frame yet, retry\n")
-            return
-        self._send(200, "image/jpeg", jpeg)
+        # Treat a snapshot as a one-shot view so capture runs even when
+        # no MJPEG stream is connected (otherwise it would stay paused).
+        store.viewer_open()
+        try:
+            jpeg, _, _ = store.snapshot()
+            if jpeg is None:
+                jpeg, _, _ = store.wait_for(-1, timeout=5.0)
+            if jpeg is None:
+                self._send(503, "text/plain; charset=utf-8", b"no frame yet, retry\n")
+                return
+            self._send(200, "image/jpeg", jpeg)
+        finally:
+            store.viewer_close()
 
     def _handle_health(self) -> None:
         store = self.server.state_store  # type: ignore[attr-defined]
-        _, frame_id, ts = store.snapshot()
+        frame_id, ts, viewers, width, height, encode_ms, _closed = store.status()
         now = time.monotonic()
         body = json.dumps(
             {
                 "ok": True,
                 "frames": frame_id,
-                "viewers": store.viewers,
-                "width": store.width,
-                "height": store.height,
+                "viewers": viewers,
+                "width": width,
+                "height": height,
                 "target_fps": self.server.state_fps,  # type: ignore[attr-defined]
-                "encode_ms": round(store.encode_ms, 2),
+                "encode_ms": round(encode_ms, 2),
                 "age_s": round(now - ts, 3) if ts else -1,
                 "uptime_s": round(now - self.server.state_start, 3),  # type: ignore[attr-defined]
-            }
+            },
+            separators=(",", ":"),
         ).encode("utf-8")
         self._send(200, "application/json", body)
 
     def _handle_mjpeg(self) -> None:
+        # HEAD must not open a viewer or start streaming.
+        if self.command == "HEAD":
+            self.send_response(200)
+            self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            return
         store: FrameStore = self.server.state_store  # type: ignore[attr-defined]
         store.viewer_open()
         try:
@@ -191,7 +207,7 @@ class _Handler(BaseHTTPRequestHandler):
                         flush()
                     except Exception:
                         break
-                    if getattr(store, "_frame_id", 0) == 0:
+                    if fid == 0:
                         continue
                     break
                 last_id = fid
@@ -215,54 +231,18 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def build_index(*, port: int, fps: float, width: int = 0, height: int = 0) -> bytes:
-    res = f"{width}x{height}" if width and height else "live"
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<meta name=theme-color content='#0b0b0d'>"
         f"<title>visrelay :{port}</title>"
         "<style>"
-        ":root{color-scheme:dark}"
-        "*{box-sizing:border-box}"
-        "body{margin:0;background:#0b0b0d;color:#e8e8ea;"
-        "font:15px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
-        "height:100vh;height:100dvh;overflow:hidden;display:flex;flex-direction:column}"
-        "header{display:flex;align-items:center;gap:10px;padding:12px 18px;"
-        "background:#101014;border-bottom:1px solid #1f1f26;flex:none}"
-        "#dot{width:10px;height:10px;border-radius:50%;background:#34d399;"
-        "box-shadow:0 0 8px #34d399;flex:none}"
-        "b{font-weight:650;letter-spacing:.2px}"
-        ".pill{font-size:12px;color:#b9b9c2;background:#1a1a20;"
-        "border:1px solid #2a2a33;padding:2px 10px;border-radius:999px;white-space:nowrap}"
-        ".spacer{flex:1}"
-        "a{color:#7dd3fc;text-decoration:none;font-size:13.5px}"
-        "a:hover{text-decoration:underline}"
-        "main{flex:1;min-height:0;display:flex;padding:12px;overflow:hidden}"
-        "img{flex:1;min-width:0;min-height:0;object-fit:contain;cursor:zoom-in;"
-        "background:#000;border:1px solid #1f1f26;border-radius:12px}"
-        "img:fullscreen{width:100%;height:100%;border:0;border-radius:0}"
-        "footer{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;"
-        "padding:12px 18px;color:#8b8b96;font-size:13px;border-top:1px solid #1f1f26;flex:none}"
-        "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#c9c9d2}"
-        "</style></head>"
-        f"<body><header><span id=dot></span><b>visrelay</b>"
-        f"<span class=pill>:{port}</span><span class=pill>{fps:g} fps</span>"
-        f"<span class=pill>{res}</span><span class=spacer></span>"
-        "<a href='/snapshot.jpg'>Snapshot</a></header>"
-        "<main><img id=live src='/stream.mjpg' alt='live screen'></main>"
-        "<footer><span>MJPEG <code>/stream.mjpg</code></span>"
-        "<span>Snapshot <code>/snapshot.jpg</code></span>"
-        "<span>Health <code>/healthz</code></span></footer>"
-        "<script>"
-        "const img=document.getElementById('live'),dot=document.getElementById('dot');"
-        "let n=0;"
-        "img.onload=()=>{n=0;dot.style.background='#34d399';"
-        "dot.style.boxShadow='0 0 8px #34d399'};"
-        "img.onerror=()=>{dot.style.background='#f87171';dot.style.boxShadow='none';"
-        "n++;setTimeout(()=>{img.src='/stream.mjpg?r='+Date.now()},Math.min(1000*n,5000))};"
-        "img.onclick=()=>{document.fullscreenElement?document.exitFullscreen():img.requestFullscreen()};"
-        "document.addEventListener('visibilitychange',()=>{"
-        "if(!document.hidden){img.src='/stream.mjpg?r='+Date.now()}});"
+        "html,body{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#000}"
+        "img{position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}"
+        "</style></head><body>"
+        "<img src='/stream.mjpg' alt='live screen'>"
+        "<script>const i=document.querySelector('img');"
+        "i.onerror=()=>setTimeout(()=>i.src='/stream.mjpg?r='+Date.now(),1000);"
+        "document.addEventListener('visibilitychange',()=>{if(!document.hidden)i.src='/stream.mjpg?r='+Date.now()});"
         "</script></body></html>"
     ).encode("utf-8")
 

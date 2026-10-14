@@ -131,7 +131,13 @@ async def request_wayland_screen():
         )
     )
 
-    raw_fd = reply.unix_fds[0] if reply.unix_fds else reply.body[0]
+    from_unix = bool(reply.unix_fds)
+    raw_fd = (reply.unix_fds[0] if from_unix else reply.body[0])
     pw_fd = os.dup(raw_fd)
-
+    if from_unix:
+        try:
+            os.close(raw_fd)
+        except OSError:
+            pass
+ 
     return pw_fd, node_id, width, height, bus

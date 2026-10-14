@@ -44,6 +44,19 @@ class FrameStore:
         with self._lock:
             return self._jpeg, self._frame_id, self._timestamp
 
+    def status(self) -> tuple[int, float, int, int, int, float, bool]:
+        """Snapshot of store metadata under one lock (avoids repeated locking)."""
+        with self._lock:
+            return (
+                self._frame_id,
+                self._timestamp,
+                self._viewers,
+                self.width,
+                self.height,
+                self.encode_ms,
+                self._closed,
+            )
+
     def close(self, reason: str = "") -> None:
         """Mark the source as gone; wakes MJPEG waiters so they exit."""
         with self._condition:
@@ -71,9 +84,9 @@ class FrameStore:
         with self._condition:
             if self._viewers > 0:
                 self._viewers -= 1
-            if self._viewers == 0:
-                self._last_viewer_ts = time.monotonic()
-                self._condition.notify_all()
+                if self._viewers == 0:
+                    self._last_viewer_ts = time.monotonic()
+                    self._condition.notify_all()
             return self._viewers
 
     def wants_capture(self, idle_timeout: float) -> bool:

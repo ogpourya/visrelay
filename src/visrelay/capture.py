@@ -73,6 +73,11 @@ class CaptureWorker(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+        try:
+            with self._store.condition:
+                self._store.condition.notify_all()
+        except Exception:
+            pass
 
     def _encode_if_changed(self, frame: np.ndarray) -> tuple[bytes, float]:
         """Encode, unless the buffer matches the last encoded one.
@@ -115,7 +120,8 @@ class CaptureWorker(threading.Thread):
                     if getattr(stream, "window_invalid", False):
                         abrupt = True
                         break
-                    self._stop.wait(0.2)
+                    with self._store.condition:
+                        self._store.condition.wait(timeout=0.2)
                     continue
                 if getattr(stream, "window_invalid", False):
                     abrupt = True
@@ -147,7 +153,8 @@ class CaptureWorker(threading.Thread):
                     if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
                         abrupt = True
                         break
-                    self._stop.wait(0.2)
+                    with self._store.condition:
+                        self._store.condition.wait(timeout=0.2)
                     continue
                 if getattr(stream, "window_invalid", False):
                     abrupt = True
@@ -216,6 +223,11 @@ class DemoWorker(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+        try:
+            with self._store.condition:
+                self._store.condition.notify_all()
+        except Exception:
+            pass
 
     def run(self) -> None:
         n = 0
@@ -225,7 +237,8 @@ class DemoWorker(threading.Thread):
         ys = (np.arange(h, dtype=np.uint16)[:, None] * 255 // max(h - 1, 1))
         while not self._stop.is_set():
             if not self._store.wants_capture(self._idle_timeout):
-                self._stop.wait(0.2)
+                with self._store.condition:
+                    self._store.condition.wait(timeout=0.2)
                 continue
             loop_start = time.perf_counter()
             frame = np.empty((h, w, 3), dtype=np.uint8)
