@@ -67,9 +67,39 @@ class CaptureWorker(threading.Thread):
         self.abrupt = False
         self.stalled = False
         self._idle_timeout = idle_timeout
+        self._last_jpeg: bytes | None = None
+        self._last_shape = None
+        self._last_sample: bytes | None = None
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _encode_if_changed(self, frame: np.ndarray) -> tuple[bytes, float]:
+        """Encode, unless the buffer matches the last encoded one.
+
+        Compares a 16KB stride sample (zero-alloc view, memcmp-fast) and
+        re-serves the cached JPEG on match. Static desktops skip the
+        ~25ms re-encode; a sub-stride change may lag one frame behind.
+        """
+        shape = frame.shape
+        sample = None
+        if frame.flags["C_CONTIGUOUS"]:
+            sample = frame.reshape(-1)[::512].tobytes()
+        if (
+            self._last_jpeg is not None
+            and sample is not None
+            and self._last_sample is not None
+            and shape == self._last_shape
+            and sample == self._last_sample
+        ):
+            return self._last_jpeg, 0.0
+        t0 = time.perf_counter()
+        jpeg = encode_frame(frame, self._quality)
+        encode_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_jpeg = jpeg
+        self._last_shape = shape
+        self._last_sample = sample
+        return jpeg, encode_ms
 
     def run(self) -> None:
         stream = self._stream
@@ -144,15 +174,13 @@ class CaptureWorker(threading.Thread):
                 if last_frame is None:
                     time.sleep(0.005)
                     continue
+                h, w = last_frame.shape[0], last_frame.shape[1]
                 try:
-                    t0 = time.perf_counter()
-                    jpeg = encode_frame(last_frame, self._quality)
-                    encode_ms = (time.perf_counter() - t0) * 1000.0
+                    jpeg, encode_ms = self._encode_if_changed(last_frame)
                 except Exception:
                     self.errors += 1
                     time.sleep(0.01)
                     continue
-                h, w = last_frame.shape[0], last_frame.shape[1]
                 self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms)
                 self.frames += 1
                 elapsed = time.perf_counter() - loop_start

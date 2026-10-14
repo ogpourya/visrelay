@@ -7,6 +7,7 @@ Streams the selected screen or application to an HTTP address.
 - Listens on `0.0.0.0:29173` at `24` fps
 - `/` viewer, `/stream.mjpg` MJPEG, `/snapshot.jpg` still, `/healthz` status
 - Pauses capture when nobody watches; resumes on connect
+- Skips re-encode on static screens (cached JPEG re-served)
 
 ## Supported platforms
 
