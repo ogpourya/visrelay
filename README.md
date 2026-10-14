@@ -1,35 +1,30 @@
 # visrelay
 
-Stream the selected Wayland screen or window to HTTP as MJPEG.
+Streams the selected screen or application to an HTTP address.
 
-Defaults: bind `0.0.0.0:29173` at 15 fps. Endpoints: `/` (viewer), `/stream.mjpg`, `/snapshot.jpg`, `/healthz`.
+## Defaults
 
-## Support scope
+- Listens on `0.0.0.0:29173` at `24` fps
+- `/` viewer, `/stream.mjpg` MJPEG, `/snapshot.jpg` still, `/healthz` status
+- Pauses capture when nobody watches; resumes on connect
 
-Currently supports and is tested only on the author's system:
+## Supported platforms
 
-- Ubuntu 26.04 LTS (kernel 7.0.0-38-generic), GNOME Shell 50.1 on Wayland (`ubuntu:GNOME`)
-- PipeWire 1.6.2 via xdg-desktop-portal ScreenCast
-- Python 3.15, Intel i3-9100F, AMD Ellesmere RX 470/480/570/580/590
-
-Other systems are not supported and not tested for now.
+Ubuntu Desktop (Wayland) for now. Requires desktop portal + PipeWire; approve the system picker when prompted. `visrelay --demo` runs anywhere without Wayland.
 
 ## Install
 
 Requires [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv tool install git+https://github.com/anomalyco/visrelay
-visrelay --help
+uv tool install https://github.com/ogpourya/visrelay.git
 ```
 
 ## Run
 
 ```sh
 visrelay
-# custom bind / rate
 visrelay --host 0.0.0.0 --port 29173 --fps 15
-# no screen picker (synthetic pattern, for testing HTTP)
 visrelay --demo
 ```
 

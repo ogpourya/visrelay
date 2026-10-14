@@ -60,7 +60,7 @@ class _Handler(BaseHTTPRequestHandler):
     index_payload: bytes = b""
     verbose: bool = False
     start_time: float = 0.0
-    target_fps: float = 15.0
+    target_fps: float = 24.0
 
     def setup(self) -> None:
         super().setup()
@@ -133,6 +133,7 @@ class _Handler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "frames": frame_id,
+                "viewers": store.viewers,
                 "width": store.width,
                 "height": store.height,
                 "target_fps": self.server.state_fps,  # type: ignore[attr-defined]
@@ -145,6 +146,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_mjpeg(self) -> None:
         store: FrameStore = self.server.state_store  # type: ignore[attr-defined]
+        store.viewer_open()
+        try:
+            self._serve_mjpeg(store)
+        finally:
+            store.viewer_close()
+
+    def _serve_mjpeg(self, store: FrameStore) -> None:
         # One-shot header; afterwards raw socket writes only (no send_header).
         try:
             self.send_response(200)
@@ -166,6 +174,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 jpeg, fid, _ = wait_for(last_id, timeout=10.0)
+                if store.is_closed():
+                    break
                 if jpeg is None:
                     # Encoder stalled/ended; keep connection open a bit, then exit
                     # so the client reconnects instead of spinning.
@@ -199,18 +209,49 @@ class _Handler(BaseHTTPRequestHandler):
 def build_index(*, port: int, fps: float, width: int = 0, height: int = 0) -> bytes:
     res = f"{width}x{height}" if width and height else "live"
     return (
-        "<!doctype html><html><head><meta charset=utf-8>"
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<meta name=theme-color content='#0b0b0d'>"
         f"<title>visrelay :{port}</title>"
-        "<style>html,body{margin:0;background:#0b0b0d;color:#e8e8ea;font:14px/1.4 system-ui,sans-serif}"
-        "header{padding:10px 14px;background:#141419}code{background:#22222a;padding:1px 6px;border-radius:6px}"
-        "main{padding:10px 14px}img{width:100%;max-height:86vh;object-fit:contain;background:#000;border-radius:8px}"
-        ".row{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;color:#b9b9c2}</style></head>"
-        f"<body><header><b>visrelay</b> &nbsp;<code>:{port}</code> &nbsp;<code>{fps:g} fps</code> &nbsp;<code>{res}</code></header>"
-        "<main><img src='/stream.mjpg' alt='live screen'>"
-        "<div class=row><span>MJPEG: <code>/stream.mjpg</code></span>"
-        "<span>Snapshot: <code>/snapshot.jpg</code></span>"
-        "<span>Health: <code>/healthz</code></span></div></main></body></html>"
+        "<style>"
+        ":root{color-scheme:dark}"
+        "*{box-sizing:border-box}"
+        "body{margin:0;background:#0b0b0d;color:#e8e8ea;"
+        "font:15px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "min-height:100vh;display:flex;flex-direction:column}"
+        "header{display:flex;align-items:center;gap:10px;padding:12px 18px;"
+        "background:#101014;border-bottom:1px solid #1f1f26;position:sticky;top:0}"
+        "#dot{width:10px;height:10px;border-radius:50%;background:#34d399;"
+        "box-shadow:0 0 8px #34d399;flex:none}"
+        "b{font-weight:650;letter-spacing:.2px}"
+        ".pill{font-size:12px;color:#b9b9c2;background:#1a1a20;"
+        "border:1px solid #2a2a33;padding:2px 10px;border-radius:999px;white-space:nowrap}"
+        ".spacer{flex:1}"
+        "a{color:#7dd3fc;text-decoration:none;font-size:13.5px}"
+        "a:hover{text-decoration:underline}"
+        "main{flex:1;display:flex;align-items:center;justify-content:center;padding:18px}"
+        "img{max-width:min(100%,1600px);max-height:78vh;object-fit:contain;"
+        "background:#000;border:1px solid #1f1f26;border-radius:12px}"
+        "footer{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;"
+        "padding:12px 18px;color:#8b8b96;font-size:13px;border-top:1px solid #1f1f26}"
+        "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#c9c9d2}"
+        "</style></head>"
+        f"<body><header><span id=dot></span><b>visrelay</b>"
+        f"<span class=pill>:{port}</span><span class=pill>{fps:g} fps</span>"
+        f"<span class=pill>{res}</span><span class=spacer></span>"
+        "<a href='/snapshot.jpg'>Snapshot</a></header>"
+        "<main><img id=live src='/stream.mjpg' alt='live screen'></main>"
+        "<footer><span>MJPEG <code>/stream.mjpg</code></span>"
+        "<span>Snapshot <code>/snapshot.jpg</code></span>"
+        "<span>Health <code>/healthz</code></span></footer>"
+        "<script>"
+        "const img=document.getElementById('live'),dot=document.getElementById('dot');"
+        "let n=0;"
+        "img.onload=()=>{n=0;dot.style.background='#34d399';"
+        "dot.style.boxShadow='0 0 8px #34d399'};"
+        "img.onerror=()=>{dot.style.background='#f87171';dot.style.boxShadow='none';"
+        "n++;setTimeout(()=>{img.src='/stream.mjpg?r='+Date.now()},Math.min(1000*n,5000))};"
+        "</script></body></html>"
     ).encode("utf-8")
 
 
@@ -238,7 +279,13 @@ def serve_forever(
     fps: float,
     verbose: bool = False,
     ready: threading.Event | None = None,
-) -> None:
+    stop_when=None,
+) -> str:
+    """Run the HTTP server until Ctrl+C or stop_when() is true.
+
+    Returns "portal-closed" when the capture source went away (user
+    stopped sharing from the desktop panel), else "ok".
+    """
     index = build_index(port=port, fps=fps, width=store.width, height=store.height)
     _Handler.index_payload = index
     srv = RelayServer((host, port), _Handler, store=store, fps=fps, verbose=verbose)
@@ -253,11 +300,23 @@ def serve_forever(
                 break
             time.sleep(0.5)
     threading.Thread(target=_refresh_index, name="visrelay-index-refresh", daemon=True).start()
+    stopped_by_watch = threading.Event()
+    if stop_when is not None:
+        def _watch() -> None:
+            while True:
+                time.sleep(0.2)
+                try:
+                    if stop_when():
+                        stopped_by_watch.set()
+                        srv.shutdown()
+                        break
+                except Exception:
+                    break
+        threading.Thread(target=_watch, name="visrelay-stop-watch", daemon=True).start()
     if ready is not None:
         ready.set()
     try:
         srv.serve_forever(poll_interval=0.2)
-    except KeyboardInterrupt:
-        pass
     finally:
         srv.server_close()
+    return "portal-closed" if stopped_by_watch.is_set() else "ok"

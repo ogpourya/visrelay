@@ -18,6 +18,10 @@ class FrameStore:
         self.width = 0
         self.height = 0
         self.encode_ms = 0.0
+        self._closed = False
+        self.close_reason = ""
+        self._viewers = 0
+        self._last_viewer_ts = 0.0
 
     @property
     def condition(self) -> threading.Condition:
@@ -40,10 +44,53 @@ class FrameStore:
         with self._lock:
             return self._jpeg, self._frame_id, self._timestamp
 
+    def close(self, reason: str = "") -> None:
+        """Mark the source as gone; wakes MJPEG waiters so they exit."""
+        with self._condition:
+            if not self._closed:
+                self._closed = True
+                self.close_reason = reason
+                self._condition.notify_all()
+
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def viewers(self) -> int:
+        with self._lock:
+            return self._viewers
+
+    def viewer_open(self) -> int:
+        with self._condition:
+            self._viewers += 1
+            self._condition.notify_all()
+            return self._viewers
+
+    def viewer_close(self) -> int:
+        with self._condition:
+            if self._viewers > 0:
+                self._viewers -= 1
+            if self._viewers == 0:
+                self._last_viewer_ts = time.monotonic()
+                self._condition.notify_all()
+            return self._viewers
+
+    def wants_capture(self, idle_timeout: float) -> bool:
+        """True while a stream viewer is connected (or within linger)."""
+        with self._lock:
+            if self._closed:
+                return False
+            if self._viewers > 0:
+                return True
+            if self._last_viewer_ts == 0.0:
+                return False
+            return (time.monotonic() - self._last_viewer_ts) < idle_timeout
+
     def wait_for(self, last_id: int, timeout: float = 5.0) -> tuple[bytes | None, int, float]:
-        """Block until a frame newer than last_id arrives (or timeout)."""
+        """Block until a frame newer than last_id arrives, closes, or timeout."""
         with self._condition:
             if self._frame_id != last_id and self._jpeg is not None:
                 return self._jpeg, self._frame_id, self._timestamp
-            self._condition.wait_for(lambda: self._frame_id != last_id, timeout=timeout)
+            self._condition.wait_for(lambda: self._frame_id != last_id or self._closed, timeout=timeout)
             return self._jpeg, self._frame_id, self._timestamp
