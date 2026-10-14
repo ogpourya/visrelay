@@ -1,0 +1,23 @@
+[project]
+name = "visrelay"
+version = "0.1.0"
+description = "Stream the selected Wayland screen/window to HTTP (MJPEG + snapshot)"
+readme = "README.md"
+authors = [
+    { name = "仌 POURYA", email = "ogpourya@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "dbus-next>=0.2.3",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "pipewire-capture>=0.2.0",
+    "simplejpeg>=1.7.0; python_version < '3.15'",
+]
+
+[project.scripts]
+visrelay = "visrelay:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
