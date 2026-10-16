@@ -24,7 +24,9 @@ FIRST_FRAME_S = 15.0
 
 
 def encode_frame(frame: np.ndarray, quality: int) -> bytes:
-    channels = frame.shape[2] if frame.ndim == 3 else 4
+    if frame.ndim != 3 or frame.shape[2] not in (3, 4):
+        raise ValueError(f"expected HxWx3/Wx4 array, got shape {frame.shape}")
+    channels = frame.shape[2]
     colorspace = "RGB" if channels == 3 else "BGRA"
     # Avoid a copy when already C-contiguous (the common case).
     if not frame.flags["C_CONTIGUOUS"]:
@@ -34,6 +36,7 @@ def encode_frame(frame: np.ndarray, quality: int) -> bytes:
             frame,
             quality=quality,
             colorspace=colorspace,
+            colorsubsampling="444" if quality >= 90 else "420",
             fastdct=True,
         )
     )
@@ -69,41 +72,43 @@ class CaptureWorker(threading.Thread):
         self._idle_timeout = idle_timeout
         self._last_jpeg: bytes | None = None
         self._last_shape = None
-        self._last_sample: bytes | None = None
+        self._last_frame: np.ndarray | None = None
 
     def stop(self) -> None:
         self._stop.set()
         try:
-            with self._store.condition:
-                self._store.condition.notify_all()
+            cond = getattr(self._store, "demand_condition", None) or self._store.condition
+            with cond:
+                cond.notify_all()
         except Exception:
             pass
 
     def _encode_if_changed(self, frame: np.ndarray) -> tuple[bytes, float]:
         """Encode, unless the buffer matches the last encoded one.
 
-        Compares a 16KB stride sample (zero-alloc view, memcmp-fast) and
-        re-serves the cached JPEG on match. Static desktops skip the
-        ~25ms re-encode; a sub-stride change may lag one frame behind.
+        Uses SIMD memcmp via np.array_equal before declaring unchanged;
+        static desktops skip the ~25ms re-encode.
         """
         shape = frame.shape
-        sample = None
-        if frame.flags["C_CONTIGUOUS"]:
-            sample = frame.reshape(-1)[::512].tobytes()
         if (
             self._last_jpeg is not None
-            and sample is not None
-            and self._last_sample is not None
+            and self._last_frame is not None
             and shape == self._last_shape
-            and sample == self._last_sample
         ):
-            return self._last_jpeg, 0.0
+            try:
+                if np.array_equal(frame, self._last_frame):
+                    return self._last_jpeg, 0.0
+            except Exception:
+                pass
         t0 = time.perf_counter()
         jpeg = encode_frame(frame, self._quality)
         encode_ms = (time.perf_counter() - t0) * 1000.0
         self._last_jpeg = jpeg
         self._last_shape = shape
-        self._last_sample = sample
+        try:
+            self._last_frame = frame.copy()
+        except Exception:
+            self._last_frame = None
         return jpeg, encode_ms
 
     def run(self) -> None:
@@ -120,8 +125,7 @@ class CaptureWorker(threading.Thread):
                     if getattr(stream, "window_invalid", False):
                         abrupt = True
                         break
-                    with self._store.condition:
-                        self._store.condition.wait(timeout=0.2)
+                    self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
                     continue
                 if getattr(stream, "window_invalid", False):
                     abrupt = True
@@ -144,8 +148,26 @@ class CaptureWorker(threading.Thread):
 
             if abrupt or stall:
                 return
+            if frame is None:
+                return
 
+            # Publish the first frame immediately (no double-fetch stall).
             last_frame = frame
+            store_last_publish_ts = 0.0
+            try:
+                h, w = last_frame.shape[0], last_frame.shape[1]
+            except Exception:
+                h, w = self._height, self._width
+            try:
+                jpeg, encode_ms = self._encode_if_changed(last_frame)
+            except Exception:
+                self.errors += 1
+                jpeg, encode_ms = None, 0.0  # type: ignore[assignment]
+            if jpeg is not None:
+                self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms)
+                self.frames += 1
+                store_last_publish_ts = time.monotonic()
+
             none_since: float | None = None
             while not self._stop.is_set():
                 if not self._store.wants_capture(self._idle_timeout):
@@ -153,8 +175,7 @@ class CaptureWorker(threading.Thread):
                     if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
                         abrupt = True
                         break
-                    with self._store.condition:
-                        self._store.condition.wait(timeout=0.2)
+                    self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
                     continue
                 if getattr(stream, "window_invalid", False):
                     abrupt = True
@@ -173,23 +194,43 @@ class CaptureWorker(threading.Thread):
                     if none_since is None:
                         none_since = time.monotonic()
                     elif time.monotonic() - none_since > NONE_STALL_S:
-                        stall = True
-                        break
+                        # Static screens may yield no damage frames; only stall
+                        # on reported errors/invalid state or when no frame
+                        # has ever arrived.
+                        if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
+                            stall = True
+                            break
+                        if last_frame is None:
+                            stall = True
+                            break
+                        none_since = time.monotonic()
                 else:
                     none_since = None
                     last_frame = latest
                 if last_frame is None:
                     time.sleep(0.005)
                     continue
-                h, w = last_frame.shape[0], last_frame.shape[1]
+                try:
+                    h, w = last_frame.shape[0], last_frame.shape[1]
+                except Exception:
+                    h, w = self._height, self._width
                 try:
                     jpeg, encode_ms = self._encode_if_changed(last_frame)
                 except Exception:
                     self.errors += 1
                     time.sleep(0.01)
                     continue
+                if encode_ms == 0.0:
+                    # Static screen: 1 Hz heartbeat keeps sockets/stall timers alive.
+                    if (time.monotonic() - store_last_publish_ts) < 1.0:
+                        elapsed = time.perf_counter() - loop_start
+                        sleep_time = self._interval - elapsed
+                        if sleep_time > 0:
+                            self._stop.wait(sleep_time)
+                        continue
                 self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms)
                 self.frames += 1
+                store_last_publish_ts = time.monotonic()
                 elapsed = time.perf_counter() - loop_start
                 sleep_time = self._interval - elapsed
                 if sleep_time > 0:
@@ -220,40 +261,45 @@ class DemoWorker(threading.Thread):
         self._height = height
         self._stop = threading.Event()
         self.frames = 0
+        self.ended = threading.Event()
 
     def stop(self) -> None:
         self._stop.set()
         try:
-            with self._store.condition:
-                self._store.condition.notify_all()
+            cond = getattr(self._store, "demand_condition", None) or self._store.condition
+            with cond:
+                cond.notify_all()
         except Exception:
             pass
 
     def run(self) -> None:
         n = 0
         w, h = self._width, self._height
-        # Precompute gradients once; per frame is just modular adds (no arange).
-        xs = np.arange(w, dtype=np.uint16)
-        ys = (np.arange(h, dtype=np.uint16)[:, None] * 255 // max(h - 1, 1))
-        while not self._stop.is_set():
-            if not self._store.wants_capture(self._idle_timeout):
-                with self._store.condition:
-                    self._store.condition.wait(timeout=0.2)
-                continue
-            loop_start = time.perf_counter()
-            frame = np.empty((h, w, 3), dtype=np.uint8)
-            frame[:, :, 0] = ((xs + n * 8) % 256).astype(np.uint8)
-            frame[:, :, 1] = ((ys + n * 2) % 256).astype(np.uint8)
-            frame[:, :, 2] = (n * 5) % 256
-            try:
-                jpeg = encode_frame(frame, self._quality)
-            except Exception:
-                time.sleep(0.05)
-                continue
-            self._store.publish(jpeg, width=w, height=h)
-            self.frames += 1
-            n += 1
-            elapsed = time.perf_counter() - loop_start
-            sleep_time = self._interval - elapsed
-            if sleep_time > 0:
-                self._stop.wait(sleep_time)
+        frame = np.empty((h, w, 3), dtype=np.uint8)
+        xs = np.arange(w, dtype=np.uint8)[None, :]
+        ys = (np.arange(h, dtype=np.uint16)[:, None] * 255 // max(h - 1, 1)).astype(np.uint8)
+        try:
+            while not self._stop.is_set():
+                if not self._store.wants_capture(self._idle_timeout):
+                    self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
+                    continue
+                loop_start = time.perf_counter()
+                np.add(xs, np.uint8((n * 8) & 0xFF), out=frame[:, :, 0])
+                np.add(ys, np.uint8((n * 2) & 0xFF), out=frame[:, :, 1])
+                frame[:, :, 2].fill((n * 5) % 256)
+                try:
+                    t0 = time.perf_counter()
+                    jpeg = encode_frame(frame, self._quality)
+                    encode_ms = (time.perf_counter() - t0) * 1000.0
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+                self._store.publish(jpeg, width=w, height=h, encode_ms=encode_ms)
+                self.frames += 1
+                n += 1
+                elapsed = time.perf_counter() - loop_start
+                sleep_time = self._interval - elapsed
+                if sleep_time > 0:
+                    self._stop.wait(sleep_time)
+        finally:
+            self.ended.set()

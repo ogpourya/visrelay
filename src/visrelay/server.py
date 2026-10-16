@@ -12,9 +12,8 @@ Performance choices (optimize to death):
   - Single encoder thread (capture.py); HTTP threads do I/O only, never encode.
   - FrameStore.publish hands out immutable `bytes`; handlers write them directly,
     no copies, no re-encode, no resize.
-  - MJPEG part headers are prebuilt prefix/suffix; per-frame work is one
-    `b"--FRAME\\r\\nContent-Type: image/jpeg\\r\\nContent-Length: N\\r\\n\\r\\n"`
-    + body + CRLF. No dict lookups in the hot loop.
+  - MJPEG parts are prebuilt once per frame in FrameStore.publish; per-frame
+    work is a single write + flush. No dict lookups in the hot loop.
   - Index/health payloads are pre-serialized once; snapshots send prebuilt
     header prefix + length.
   - TCP_NODELAY set per connection; daemon threads; allow_reuse_address.
@@ -55,13 +54,6 @@ class _Handler(BaseHTTPRequestHandler):
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
-    # Class-level shared state, wired by `serve()`.
-    store: FrameStore = None  # type: ignore[assignment]
-    index_payload: bytes = b""
-    verbose: bool = False
-    start_time: float = 0.0
-    target_fps: float = 24.0
-
     def setup(self) -> None:
         super().setup()
         try:
@@ -80,7 +72,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: ANN001, ANN002
-        if self.verbose:
+        try:
+            verbose = self.server.verbose  # type: ignore[attr-defined]
+        except Exception:
+            verbose = False
+        if verbose:
             super().log_message(fmt, *args)
 
     def _send(self, code: int, ctype: str, body: bytes, extra: tuple[tuple[str, str], ...] = ()) -> None:
@@ -104,7 +100,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = _strip_query(self.path)
         if path == "/":
-            self._send(200, "text/html; charset=utf-8", self.index_payload)
+            try:
+                payload = self.server.index_payload  # type: ignore[attr-defined]
+            except Exception:
+                payload = b""
+            self._send(200, "text/html; charset=utf-8", payload)
         elif path in STREAM_PATHS:
             self._handle_mjpeg()
         elif path in SNAPSHOT_PATHS:
@@ -124,19 +124,19 @@ class _Handler(BaseHTTPRequestHandler):
     # -- hot paths ------------------------------------------------------
     def _handle_snapshot(self) -> None:
         store = self.server.state_store  # type: ignore[attr-defined]
-        # Treat a snapshot as a one-shot view so capture runs even when
-        # no MJPEG stream is connected (otherwise it would stay paused).
-        store.viewer_open()
         try:
-            jpeg, _, _ = store.snapshot()
-            if jpeg is None:
-                jpeg, _, _ = store.wait_for(-1, timeout=5.0)
-            if jpeg is None:
-                self._send(503, "text/plain; charset=utf-8", b"no frame yet, retry\n")
-                return
-            self._send(200, "image/jpeg", jpeg)
-        finally:
-            store.viewer_close()
+            fps = self.server.state_fps  # type: ignore[attr-defined]
+        except Exception:
+            fps = 24.0
+        try:
+            max_age = max(1.0, 2.0 / max(float(fps), 1.0))
+        except Exception:
+            max_age = 1.0
+        jpeg = store.snapshot_fresh(max_age=max_age, timeout=5.0)
+        if jpeg is None:
+            self._send(503, "text/plain; charset=utf-8", b"no frame yet, retry\n")
+            return
+        self._send(200, "image/jpeg", jpeg)
 
     def _handle_health(self) -> None:
         store = self.server.state_store  # type: ignore[attr-defined]
@@ -144,7 +144,7 @@ class _Handler(BaseHTTPRequestHandler):
         now = time.monotonic()
         body = json.dumps(
             {
-                "ok": True,
+                "ok": not _closed,
                 "frames": frame_id,
                 "viewers": viewers,
                 "width": width,
@@ -156,7 +156,7 @@ class _Handler(BaseHTTPRequestHandler):
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        self._send(200, "application/json", body)
+        self._send(503 if _closed else 200, "application/json", body)
 
     def _handle_mjpeg(self) -> None:
         # HEAD must not open a viewer or start streaming.
@@ -191,35 +191,35 @@ class _Handler(BaseHTTPRequestHandler):
         wfile = self.wfile
         write = wfile.write
         flush = wfile.flush
-        wait_for = store.wait_for
-        boundary = BOUNDARY_B
+        wait_for_part = store.wait_for_part if hasattr(store, "wait_for_part") else None
         last_id = -1
         # Local bindings: avoids attribute lookups in the 15Hz hot loop.
         try:
             while True:
-                jpeg, fid, _ = wait_for(last_id, timeout=10.0)
+                if wait_for_part is not None:
+                    part, _, fid, _ = wait_for_part(last_id, timeout=10.0)
+                else:
+                    jpeg, fid, _ = store.wait_for(last_id, timeout=10.0)
+                    part = None
+                    if fid != last_id and jpeg is not None:
+                        part = (
+                            BOUNDARY_B + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                            + str(len(jpeg)).encode("ascii") + b"\r\n\r\n" + jpeg + CRLF
+                        )
                 if store.is_closed():
                     break
-                if jpeg is None:
-                    # Encoder stalled/ended; keep connection open a bit, then exit
-                    # so the client reconnects instead of spinning.
+                if part is None or fid == last_id:
+                    # Timeout without a new frame: probe socket, keep alive.
+                    if fid == 0:
+                        break
                     try:
                         flush()
                     except Exception:
                         break
-                    if fid == 0:
-                        continue
-                    break
+                    continue
                 last_id = fid
-                # Prebuilt part header; single length format is the only alloc.
-                header = (
-                    boundary + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                    + str(len(jpeg)).encode("ascii") + b"\r\n\r\n"
-                )
                 try:
-                    write(header)
-                    write(jpeg)
-                    write(CRLF)
+                    write(part)
                     flush()
                 except (BrokenPipeError, ConnectionResetError, ValueError, TimeoutError):
                     break
@@ -256,10 +256,8 @@ class RelayServer(ThreadingHTTPServer):
         self.state_store = store
         self.state_fps = fps
         self.state_start = time.monotonic()
-        handler.store = store
-        handler.verbose = verbose
-        handler.start_time = self.state_start
-        handler.target_fps = fps
+        self.verbose = verbose
+        self.index_payload = b""
         super().__init__(addr, handler)
 
 
@@ -272,6 +270,7 @@ def serve_forever(
     verbose: bool = False,
     ready: threading.Event | None = None,
     stop_when=None,
+    on_ready=None,
 ) -> str:
     """Run the HTTP server until Ctrl+C or stop_when() is true.
 
@@ -279,19 +278,9 @@ def serve_forever(
     stopped sharing from the desktop panel), else "ok".
     """
     index = build_index(port=port, fps=fps, width=store.width, height=store.height)
-    _Handler.index_payload = index
     srv = RelayServer((host, port), _Handler, store=store, fps=fps, verbose=verbose)
-    # Refresh index once dimensions are known (portal may resolve after bind).
-    def _refresh_index() -> None:
-        time.sleep(0.5)
-        saw = (store.width, store.height)
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if (store.width, store.height) != saw and store.width:
-                _Handler.index_payload = build_index(port=port, fps=fps, width=store.width, height=store.height)
-                break
-            time.sleep(0.5)
-    threading.Thread(target=_refresh_index, name="visrelay-index-refresh", daemon=True).start()
+    # Bind has succeeded at this point (RelayServer.__init__ binds).
+    srv.index_payload = index
     stopped_by_watch = threading.Event()
     if stop_when is not None:
         def _watch() -> None:
@@ -307,6 +296,11 @@ def serve_forever(
         threading.Thread(target=_watch, name="visrelay-stop-watch", daemon=True).start()
     if ready is not None:
         ready.set()
+    if on_ready is not None:
+        try:
+            on_ready()
+        except Exception:
+            pass
     try:
         srv.serve_forever(poll_interval=0.2)
     finally:

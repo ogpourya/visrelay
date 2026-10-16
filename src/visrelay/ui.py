@@ -106,8 +106,9 @@ def row(label: str, value: str, width: int = 8) -> None:
 
 
 def ready(host: str, port: int) -> None:
-    viewer = f"http://{host}:{port}/"
-    stream = f"http://{host}:{port}/stream.mjpg"
+    host_fmt = f"[{host}]" if (":" in host and not host.startswith("[")) else host
+    viewer = f"http://{host_fmt}:{port}/"
+    stream = f"http://{host_fmt}:{port}/stream.mjpg"
     print("", flush=True)
     row("Viewer", link(viewer))
     row("Stream", link(stream))
@@ -177,3 +178,6 @@ class Spinner:
             waiting(self._msg)
             # Small beat so ●/● ordering reads correctly.
             time.sleep(0.02)
+        elif self._tty and not clear:
+            sys.stdout.write("\n")
+            sys.stdout.flush()

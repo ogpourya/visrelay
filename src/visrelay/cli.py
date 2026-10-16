@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
 import socket
 import sys
 import threading
@@ -20,6 +21,26 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 29173
 DEFAULT_FPS = 24.0
 DEFAULT_QUALITY = 80
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except (ValueError, AttributeError):
+        return default
 
 
 def _lan_ip() -> str | None:
@@ -112,13 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--host", default=os.environ.get("VISRELAY_HOST", DEFAULT_HOST),
                    help=f"Bind address (default {DEFAULT_HOST})")
-    p.add_argument("--port", type=int, default=int(os.environ.get("VISRELAY_PORT", DEFAULT_PORT)),
+    p.add_argument("--port", type=int, default=_env_int("VISRELAY_PORT", DEFAULT_PORT),
                    help=f"Bind port (default {DEFAULT_PORT})")
-    p.add_argument("--fps", type=float, default=float(os.environ.get("VISRELAY_FPS", DEFAULT_FPS)),
+    p.add_argument("--fps", type=float, default=_env_float("VISRELAY_FPS", DEFAULT_FPS),
                    help=f"Target capture fps (default {DEFAULT_FPS:g}; paced to save CPU)")
-    p.add_argument("--idle-timeout", type=float, default=float(os.environ.get("VISRELAY_IDLE_TIMEOUT", 5.0)),
+    p.add_argument("--idle-timeout", type=float, default=_env_float("VISRELAY_IDLE_TIMEOUT", 5.0),
                    help="Keep capturing N seconds after the last viewer leaves (default 5; 0 = pause immediately)")
-    p.add_argument("--quality", type=int, default=int(os.environ.get("VISRELAY_QUALITY", DEFAULT_QUALITY)),
+    p.add_argument("--quality", type=int, default=_env_int("VISRELAY_QUALITY", DEFAULT_QUALITY),
                    help=f"JPEG quality 1-100 (default {DEFAULT_QUALITY}; lower = faster/smaller)")
     p.add_argument("--demo", action="store_true",
                    help="Serve a synthetic test pattern (no Wayland/portal needed)")
@@ -148,12 +169,32 @@ def main(argv: list[str] | None = None) -> int:
     if not (0 < args.fps <= 60):
         _ui.error("visrelay: error: --fps must be 0 < fps <= 60")
         return 2
+    if not (1 <= args.port <= 65535):
+        _ui.error("visrelay: error: --port must be 1-65535")
+        return 2
+    if not (args.idle_timeout >= 0):
+        _ui.error("visrelay: error: --idle-timeout must be >= 0")
+        return 2
+    if not (16 <= args.demo_width <= 7680):
+        _ui.error("visrelay: error: --demo-width must be 16-7680")
+        return 2
+    if not (16 <= args.demo_height <= 7680):
+        _ui.error("visrelay: error: --demo-height must be 16-7680")
+        return 2
 
     store = FrameStore()
     worker = None
     cleanup = None
     width = height = 0
     is_demo = bool(args.demo)
+
+    def _sigterm(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _sigterm)
+    except Exception:
+        pass
 
     _ui.header()
 
@@ -211,6 +252,15 @@ def main(argv: list[str] | None = None) -> int:
         worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
                                width=width, height=height, idle_timeout=args.idle_timeout)
         worker.start()
+        fd_state = {"closed": False}
+
+        def _close_fd_once() -> None:
+            if not fd_state["closed"]:
+                fd_state["closed"] = True
+                try:
+                    os.close(pw_fd)
+                except OSError:
+                    pass
 
         def _cleanup() -> None:
             try:
@@ -218,13 +268,14 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pass
             try:
-                stream.stop()
+                worker.join(timeout=2.0)
             except Exception:
                 pass
             try:
-                os.close(pw_fd)
-            except OSError:
+                stream.stop()
+            except Exception:
                 pass
+            _close_fd_once()
             try:
                 bus.disconnect()
             except Exception:
@@ -238,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .server import serve_forever
 
-    _ui.ready(_display_host(args.host), args.port)
+    display_host = _display_host(args.host)
 
     def _stall_watch() -> None:
         while not store.is_closed():
@@ -254,14 +305,17 @@ def main(argv: list[str] | None = None) -> int:
     stop_when = None if is_demo else store.is_closed
     try:
         serve_forever(store, host=args.host, port=args.port, fps=args.fps,
-                      verbose=args.verbose, stop_when=stop_when)
+                      verbose=args.verbose, stop_when=stop_when,
+                      on_ready=lambda: _ui.ready(display_host, args.port))
     except KeyboardInterrupt:
         _ui.stopped()
     except OSError as e:
         _ui.error(f"cannot listen on {args.host}:{args.port}: {e}")
         return 1
     finally:
-        if worker is not None:
+        if cleanup is not None:
+            cleanup()
+        elif worker is not None:
             try:
                 worker.stop()
             except Exception:
@@ -272,8 +326,6 @@ def main(argv: list[str] | None = None) -> int:
                     worker.join(timeout=2.0)
                 except Exception:
                     pass
-        if cleanup is not None:
-            cleanup()
         # Allow server threads to drain.
         time.sleep(0.1)
     if store.is_closed():
