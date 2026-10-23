@@ -44,14 +44,6 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _lan_ip() -> str | None:
-    """First IPv4 of a physical LAN interface (skips VPN/tunnel/bridge).
-
-    The old UDP-to-8.8.8.8 trick follows the default route, which points
-    into VPN tunnels (e.g. happ-xray 172.19.0.1) when one is active.
-    Instead enumerate interfaces and require UP + BROADCAST while
-    excluding POINTOPOINT / NOARP / LOOPBACK and virtual names, so we
-    land on e.g. enp5s0 192.168.70.168.
-    """
     try:
         import array
         import fcntl
@@ -92,7 +84,6 @@ def _lan_ip() -> str | None:
                 continue
             if ip.startswith("127.") or ip.startswith("169.254."):
                 continue
-            # Prefer real NIC names (en/eth/wl/wlan) over the rest.
             prio = 0 if ln.startswith(("en", "eth", "wl", "wlan", "wlp")) else 1
             cands.append((prio, ip))
         cands.sort()
@@ -102,7 +93,6 @@ def _lan_ip() -> str | None:
 
 
 def _display_host(bind_host: str) -> str:
-    """Host to show in copy-pasteable URLs (0.0.0.0 is not connectable)."""
     if bind_host not in ("0.0.0.0", "::", "", "0:0:0:0:0:0:0:0"):
         return bind_host
     try:
@@ -114,7 +104,6 @@ def _display_host(bind_host: str) -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # No traffic sent; only selects the default-route source IP.
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
         finally:
@@ -207,7 +196,6 @@ def main(argv: list[str] | None = None) -> int:
                             idle_timeout=args.idle_timeout)
         worker.start()
     else:
-        # Heavy Wayland-only imports stay lazy so --help/--demo stay instant.
         try:
             from .portal import request_wayland_screen
             from pipewire_capture import CaptureStream
@@ -216,17 +204,19 @@ def main(argv: list[str] | None = None) -> int:
                       "  try `visrelay --demo` without Wayland.")
             return 1
 
-        spin = _ui.Spinner("Select a screen or window in the system dialog…")
+        spin = _ui.Spinner("Select a screen or window in the system dialog...")
         spin.start()
         loop = asyncio.new_event_loop()
         try:
-            session = loop.run_until_complete(request_wayland_screen())
-        except Exception as e:
+            try:
+                session = loop.run_until_complete(request_wayland_screen())
+            except Exception as e:
+                _ui.error(f"screen picker failed: {e}")
+                loop.close()
+                return 1
+        finally:
             spin.stop(clear=True)
-            _ui.error(f"screen picker failed: {e}")
-            loop.close()
-            return 1
-        spin.stop(clear=True)
+
         if session is None:
             _ui.cancelled()
             loop.close()
@@ -246,7 +236,10 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
             bus.disconnect()
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
             return 1
 
         worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
@@ -278,6 +271,14 @@ def main(argv: list[str] | None = None) -> int:
             _close_fd_once()
             try:
                 bus.disconnect()
+            except Exception:
+                pass
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             except Exception:
                 pass
             try:
@@ -320,17 +321,17 @@ def main(argv: list[str] | None = None) -> int:
                 worker.stop()
             except Exception:
                 pass
-            # Give the encoder a beat to exit its sleep; don't block shutdown.
             if hasattr(worker, "join"):
                 try:
                     worker.join(timeout=2.0)
                 except Exception:
                     pass
-        # Allow server threads to drain.
         time.sleep(0.1)
+
     if store.is_closed():
         if store.close_reason == "capture stalled":
             _ui.stalled()
+            return 1
         else:
             _ui.sharing_stopped()
     return 0

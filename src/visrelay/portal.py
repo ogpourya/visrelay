@@ -139,8 +139,9 @@ async def request_wayland_screen():
             return None
 
         streams = res["streams"].value
-        node_id, props = streams[0]
-        size = props["size"].value if "size" in props else [1920, 1080]
+        node_id = int(streams[0][0])
+        props = streams[0][1]
+        size = props.get("size").value if "size" in props else [1920, 1080]
         width, height = int(size[0]), int(size[1])
 
         # 4. Get the raw PipeWire file descriptor
@@ -158,25 +159,25 @@ async def request_wayland_screen():
             bus.disconnect()
             raise RuntimeError(f"Portal OpenPipeWireRemote failed: {reply.body}")
 
-        if reply.unix_fds:
-            idx = reply.body[0] if reply.body else 0
+        if not reply.unix_fds:
+            bus.disconnect()
+            raise RuntimeError(f"OpenPipeWireRemote returned no UNIX FDs; portal D-Bus FD passing failed: {reply.body}")
+
+        idx = reply.body[0] if reply.body else 0
+        try:
+            idx = int(idx)
+        except Exception:
+            idx = 0
+        if not 0 <= idx < len(reply.unix_fds):
+            bus.disconnect()
+            raise RuntimeError(f"Portal OpenPipeWireRemote bad fd index: {reply.body}")
+        raw_fd = reply.unix_fds[idx]
+        pw_fd = os.dup(raw_fd)
+        for fd in reply.unix_fds:
             try:
-                idx = int(idx)
-            except Exception:
-                idx = 0
-            if not 0 <= idx < len(reply.unix_fds):
-                bus.disconnect()
-                raise RuntimeError(f"Portal OpenPipeWireRemote bad fd index: {reply.body}")
-            raw_fd = reply.unix_fds[idx]
-            pw_fd = os.dup(raw_fd)
-            for fd in reply.unix_fds:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-        else:
-            raw_fd = reply.body[0]
-            pw_fd = os.dup(raw_fd)
+                os.close(fd)
+            except OSError:
+                pass
 
         return pw_fd, node_id, width, height, bus
     except Exception:

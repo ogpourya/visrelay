@@ -90,15 +90,15 @@ def get_version() -> str:
 
 def header() -> None:
     v = get_version()
-    print(f"{cyan('◆')} {bold('visrelay')} {dim(v)}", flush=True)
+    print(f"{cyan('●')} {bold('visrelay')} {dim(v)}", flush=True)
 
 
 def waiting(msg: str) -> None:
-    print(f"{yellow('◇')} {msg}", flush=True)
+    print(f"{yellow('○')} {msg}", flush=True)
 
 
 def success(msg: str) -> None:
-    print(f"{green('●')} {msg}", flush=True)
+    print(f"{green('✔')} {msg}", flush=True)
 
 
 def row(label: str, value: str, width: int = 8) -> None:
@@ -118,7 +118,7 @@ def ready(host: str, port: int) -> None:
 
 def error(msg: str) -> None:
     stream = sys.stderr
-    print(f"{red('✕', stream=stream)} {msg}", file=stream, flush=True)
+    print(f"{red('✖', stream=stream)} {msg}", file=stream, flush=True)
 
 
 def cancelled(msg: str = "Selection cancelled.") -> None:
@@ -131,11 +131,11 @@ def stopped() -> None:
 
 
 def sharing_stopped() -> None:
-    print(f"{yellow('○')} Sharing stopped.", flush=True)
+    print(f"{yellow('■')} Sharing stopped.", flush=True)
 
 
 def stalled() -> None:
-    print(f"{yellow('○')} Capture stalled.", flush=True)
+    print(f"{yellow('▲')} Capture stalled.", flush=True)
 
 
 class Spinner:
@@ -150,6 +150,9 @@ class Spinner:
         self._tty = supports_color()
 
     def start(self) -> None:
+        if self._tty:
+            sys.stdout.write("\x1b[?25l")
+            sys.stdout.flush()
         if not self._tty:
             waiting(self._msg)
             return
@@ -171,13 +174,12 @@ class Spinner:
         if self._thread is not None:
             self._thread.join(timeout=0.5)
             self._thread = None
+        if self._tty:
+            sys.stdout.write("\x1b[?25h")
+            sys.stdout.flush()
         if self._tty and clear:
             sys.stdout.write("\r\x1b[K")
             sys.stdout.flush()
-            # Static line remains in scrollback so the run is auditable.
-            waiting(self._msg)
-            # Small beat so ●/● ordering reads correctly.
-            time.sleep(0.02)
         elif self._tty and not clear:
             sys.stdout.write("\n")
             sys.stdout.flush()

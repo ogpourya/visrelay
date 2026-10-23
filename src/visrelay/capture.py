@@ -16,9 +16,6 @@ import simplejpeg
 from .frames import FrameStore
 
 
-# Feed-stall detection: a healthy PipeWire feed delivers a first frame
-# quickly and never goes silent (None) for long while demanded. Static
-# screens still deliver repeat frames, so these can't false-positive.
 NONE_STALL_S = 10.0
 FIRST_FRAME_S = 15.0
 
@@ -28,7 +25,6 @@ def encode_frame(frame: np.ndarray, quality: int) -> bytes:
         raise ValueError(f"expected HxWx3/Wx4 array, got shape {frame.shape}")
     channels = frame.shape[2]
     colorspace = "RGB" if channels == 3 else "BGRA"
-    # Avoid a copy when already C-contiguous (the common case).
     if not frame.flags["C_CONTIGUOUS"]:
         frame = np.ascontiguousarray(frame)
     return bytes(
@@ -73,6 +69,7 @@ class CaptureWorker(threading.Thread):
         self._last_jpeg: bytes | None = None
         self._last_shape = None
         self._last_frame: np.ndarray | None = None
+        self._last_frame_buf: np.ndarray | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -84,11 +81,8 @@ class CaptureWorker(threading.Thread):
             pass
 
     def _encode_if_changed(self, frame: np.ndarray) -> tuple[bytes, float]:
-        """Encode, unless the buffer matches the last encoded one.
-
-        Uses SIMD memcmp via np.array_equal before declaring unchanged;
-        static desktops skip the ~25ms re-encode.
-        """
+        if frame is self._last_frame and self._last_jpeg is not None:
+            return self._last_jpeg, 0.0
         shape = frame.shape
         if (
             self._last_jpeg is not None
@@ -106,9 +100,15 @@ class CaptureWorker(threading.Thread):
         self._last_jpeg = jpeg
         self._last_shape = shape
         try:
-            self._last_frame = frame.copy()
+            if self._last_frame_buf is None or self._last_frame_buf.shape != shape:
+                self._last_frame_buf = np.empty_like(frame)
+            np.copyto(self._last_frame_buf, frame)
+            self._last_frame = self._last_frame_buf
         except Exception:
-            self._last_frame = None
+            try:
+                self._last_frame = frame.copy()
+            except Exception:
+                self._last_frame = None
         return jpeg, encode_ms
 
     def run(self) -> None:
@@ -116,7 +116,6 @@ class CaptureWorker(threading.Thread):
         abrupt = False
         stall = False
         try:
-            # Wait briefly for the first buffer (mirrors main.py behaviour).
             frame = None
             no_frame_since: float | None = None
             while frame is None and not self._stop.is_set():
@@ -127,7 +126,7 @@ class CaptureWorker(threading.Thread):
                         break
                     self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
                     continue
-                if getattr(stream, "window_invalid", False):
+                if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
                     abrupt = True
                     break
                 try:
@@ -146,12 +145,13 @@ class CaptureWorker(threading.Thread):
                 else:
                     no_frame_since = None
 
-            if abrupt or stall:
-                return
-            if frame is None:
+            if abrupt or stall or frame is None:
+                if abrupt:
+                    self.abrupt = True
+                if stall:
+                    self.stalled = True
                 return
 
-            # Publish the first frame immediately (no double-fetch stall).
             last_frame = frame
             store_last_publish_ts = 0.0
             try:
@@ -164,7 +164,7 @@ class CaptureWorker(threading.Thread):
                 self.errors += 1
                 jpeg, encode_ms = None, 0.0  # type: ignore[assignment]
             if jpeg is not None:
-                self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms)
+                self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms, hardware=True)
                 self.frames += 1
                 store_last_publish_ts = time.monotonic()
 
@@ -177,12 +177,10 @@ class CaptureWorker(threading.Thread):
                         break
                     self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
                     continue
-                if getattr(stream, "window_invalid", False):
+                if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
                     abrupt = True
                     break
-                if getattr(stream, "error", None):
-                    abrupt = True
-                    break
+
                 loop_start = time.perf_counter()
                 try:
                     latest = stream.get_frame()
@@ -190,26 +188,35 @@ class CaptureWorker(threading.Thread):
                     self.errors += 1
                     abrupt = True
                     break
+
                 if latest is None:
-                    if none_since is None:
-                        none_since = time.monotonic()
-                    elif time.monotonic() - none_since > NONE_STALL_S:
-                        # Static screens may yield no damage frames; only stall
-                        # on reported errors/invalid state or when no frame
-                        # has ever arrived.
-                        if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
+                    # Static screen / no new damage frame from compositor.
+                    if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
+                        stall = True
+                        break
+                    if last_frame is None:
+                        if none_since is None:
+                            none_since = time.monotonic()
+                        elif time.monotonic() - none_since > NONE_STALL_S:
                             stall = True
                             break
-                        if last_frame is None:
-                            stall = True
-                            break
-                        none_since = time.monotonic()
-                else:
-                    none_since = None
-                    last_frame = latest
-                if last_frame is None:
-                    time.sleep(0.005)
+                        time.sleep(0.005)
+                        continue
+
+                    # No call to _encode_if_changed when latest is None!
+                    now = time.monotonic()
+                    if (now - store_last_publish_ts) >= 1.0 and self._last_jpeg is not None:
+                        self._store.publish(self._last_jpeg, width=w or self._width, height=h or self._height, encode_ms=0.0, hardware=False)
+                        store_last_publish_ts = now
+
+                    elapsed = time.perf_counter() - loop_start
+                    sleep_time = self._interval - elapsed
+                    if sleep_time > 0:
+                        self._stop.wait(sleep_time)
                     continue
+
+                none_since = None
+                last_frame = latest
                 try:
                     h, w = last_frame.shape[0], last_frame.shape[1]
                 except Exception:
@@ -220,21 +227,22 @@ class CaptureWorker(threading.Thread):
                     self.errors += 1
                     time.sleep(0.01)
                     continue
+
                 if encode_ms == 0.0:
-                    # Static screen: 1 Hz heartbeat keeps sockets/stall timers alive.
-                    if (time.monotonic() - store_last_publish_ts) < 1.0:
+                    now = time.monotonic()
+                    if (now - store_last_publish_ts) < 1.0:
                         elapsed = time.perf_counter() - loop_start
                         sleep_time = self._interval - elapsed
                         if sleep_time > 0:
                             self._stop.wait(sleep_time)
                         continue
-                self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms)
+
+                self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms, hardware=True)
                 self.frames += 1
                 store_last_publish_ts = time.monotonic()
                 elapsed = time.perf_counter() - loop_start
                 sleep_time = self._interval - elapsed
                 if sleep_time > 0:
-                    # Wake early on stop().
                     self._stop.wait(sleep_time)
         finally:
             if not self._stop.is_set():
@@ -244,6 +252,8 @@ class CaptureWorker(threading.Thread):
                 elif stall:
                     self.stalled = True
                     self._store.close("capture stalled")
+                else:
+                    self._store.close("sharing stopped")
             self.ended.set()
 
 
@@ -294,7 +304,7 @@ class DemoWorker(threading.Thread):
                 except Exception:
                     time.sleep(0.05)
                     continue
-                self._store.publish(jpeg, width=w, height=h, encode_ms=encode_ms)
+                self._store.publish(jpeg, width=w, height=h, encode_ms=encode_ms, hardware=True)
                 self.frames += 1
                 n += 1
                 elapsed = time.perf_counter() - loop_start
@@ -302,4 +312,5 @@ class DemoWorker(threading.Thread):
                 if sleep_time > 0:
                     self._stop.wait(sleep_time)
         finally:
+            self._store.close("sharing stopped")
             self.ended.set()

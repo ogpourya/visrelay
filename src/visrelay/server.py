@@ -24,6 +24,7 @@ Performance choices (optimize to death):
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,7 +61,6 @@ class _Handler(BaseHTTPRequestHandler):
             import socket as _socket
 
             self.request.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
-            # Don't let a stalled background-tab connection hold a thread forever.
             self.request.settimeout(20.0)
         except Exception:
             pass
@@ -80,7 +80,6 @@ class _Handler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     def _send(self, code: int, ctype: str, body: bytes, extra: tuple[tuple[str, str], ...] = ()) -> None:
-        # Fast direct header write for tiny responses (health/index/errors).
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -88,8 +87,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         for k, v in extra:
             self.send_header(k, v)
-        # Keep-alive for snapshots/health so browsers reuse the connection.
-        self.send_header("Connection", "keep-alive")
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        else:
+            self.send_header("Connection", "keep-alive")
         self.end_headers()
         if self.command != "HEAD" and body:
             try:
@@ -114,14 +115,16 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/favicon.ico":
             self.send_response(204)
             self.send_header("Content-Length", "0")
-            self.send_header("Connection", "keep-alive")
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            else:
+                self.send_header("Connection", "keep-alive")
             self.end_headers()
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found\n")
 
     do_HEAD = do_GET  # type: ignore[assignment]
 
-    # -- hot paths ------------------------------------------------------
     def _handle_snapshot(self) -> None:
         store = self.server.state_store  # type: ignore[attr-defined]
         try:
@@ -159,14 +162,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(503 if _closed else 200, "application/json", body)
 
     def _handle_mjpeg(self) -> None:
-        # HEAD must not open a viewer or start streaming.
         if self.command == "HEAD":
             self.send_response(200)
             self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", "0")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self.end_headers()
             return
         store: FrameStore = self.server.state_store  # type: ignore[attr-defined]
@@ -177,7 +179,6 @@ class _Handler(BaseHTTPRequestHandler):
             store.viewer_close()
 
     def _serve_mjpeg(self, store: FrameStore) -> None:
-        # One-shot header; afterwards raw socket writes only (no send_header).
         try:
             self.send_response(200)
             self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
@@ -189,29 +190,27 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         wfile = self.wfile
-        write = wfile.write
+        writelines = wfile.writelines
         flush = wfile.flush
         wait_for_part = store.wait_for_part if hasattr(store, "wait_for_part") else None
         last_id = -1
-        # Local bindings: avoids attribute lookups in the 15Hz hot loop.
         try:
             while True:
+                if store.is_closed():
+                    break
                 if wait_for_part is not None:
-                    part, _, fid, _ = wait_for_part(last_id, timeout=10.0)
+                    header, jpeg, fid, _ = wait_for_part(last_id, timeout=10.0)
                 else:
                     jpeg, fid, _ = store.wait_for(last_id, timeout=10.0)
-                    part = None
+                    header = None
                     if fid != last_id and jpeg is not None:
-                        part = (
+                        header = (
                             BOUNDARY_B + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                            + str(len(jpeg)).encode("ascii") + b"\r\n\r\n" + jpeg + CRLF
+                            + str(len(jpeg)).encode("ascii") + b"\r\n\r\n"
                         )
                 if store.is_closed():
                     break
-                if part is None or fid == last_id:
-                    # Timeout without a new frame: probe socket, keep alive.
-                    if fid == 0:
-                        break
+                if header is None or jpeg is None or fid == last_id:
                     try:
                         flush()
                     except Exception:
@@ -219,7 +218,7 @@ class _Handler(BaseHTTPRequestHandler):
                     continue
                 last_id = fid
                 try:
-                    write(part)
+                    writelines([header, jpeg, CRLF])
                     flush()
                 except (BrokenPipeError, ConnectionResetError, ValueError, TimeoutError):
                     break
@@ -258,6 +257,8 @@ class RelayServer(ThreadingHTTPServer):
         self.state_start = time.monotonic()
         self.verbose = verbose
         self.index_payload = b""
+        if ":" in str(addr[0]):
+            self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
 
 
@@ -279,7 +280,6 @@ def serve_forever(
     """
     index = build_index(port=port, fps=fps, width=store.width, height=store.height)
     srv = RelayServer((host, port), _Handler, store=store, fps=fps, verbose=verbose)
-    # Bind has succeeded at this point (RelayServer.__init__ binds).
     srv.index_payload = index
     stopped_by_watch = threading.Event()
     if stop_when is not None:
