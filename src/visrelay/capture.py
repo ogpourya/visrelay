@@ -1,12 +1,13 @@
 """Background capture loop: PipeWire -> JPEG -> FrameStore.
 
-Paced to a target FPS (default 24) to leave headroom for HTTP serving.
-JPEG encoding uses simplejpeg (libjpeg-turbo SIMD). The loop idles
-(no pulls, no encodes) while no stream viewer is connected.
+Paced to a target FPS to leave headroom for HTTP serving.
+Monitors PipeWire FD hangup and stream state for instant disconnect detection.
 """
 
 from __future__ import annotations
 
+import os
+import select
 import threading
 import time
 
@@ -14,7 +15,6 @@ import numpy as np
 import simplejpeg
 
 from .frames import FrameStore
-
 
 NONE_STALL_S = 10.0
 FIRST_FRAME_S = 15.0
@@ -51,6 +51,7 @@ class CaptureWorker(threading.Thread):
         width: int = 0,
         height: int = 0,
         idle_timeout: float = 5.0,
+        pw_fd: int | None = None,
     ) -> None:
         super().__init__(name="visrelay-capture", daemon=True)
         self._stream = stream
@@ -71,6 +72,17 @@ class CaptureWorker(threading.Thread):
         self._last_frame: np.ndarray | None = None
         self._last_frame_buf: np.ndarray | None = None
 
+        self._poll = None
+        self._poll_fd = None
+        if pw_fd is not None:
+            try:
+                self._poll_fd = os.dup(pw_fd)
+                self._poll = select.poll()
+                self._poll.register(self._poll_fd, select.POLLHUP | select.POLLERR | select.POLLNVAL)
+            except OSError:
+                self._poll = None
+                self._poll_fd = None
+
     def stop(self) -> None:
         self._stop.set()
         try:
@@ -79,6 +91,22 @@ class CaptureWorker(threading.Thread):
                 cond.notify_all()
         except Exception:
             pass
+
+    def _is_stream_disconnected(self) -> bool:
+        if getattr(self._stream, "window_invalid", False):
+            return True
+        if getattr(self._stream, "error", None):
+            return True
+        if hasattr(self._stream, "is_alive") and not self._stream.is_alive():
+            return True
+        if self._poll and self._poll_fd is not None:
+            try:
+                events = self._poll.poll(0)
+                if events:
+                    return True
+            except Exception:
+                return True
+        return False
 
     def _encode_if_changed(self, frame: np.ndarray) -> tuple[bytes, float]:
         if frame is self._last_frame and self._last_jpeg is not None:
@@ -121,20 +149,23 @@ class CaptureWorker(threading.Thread):
             while frame is None and not self._stop.is_set():
                 if not self._store.wants_capture(self._idle_timeout):
                     no_frame_since = None
-                    if getattr(stream, "window_invalid", False):
+                    if self._is_stream_disconnected():
                         abrupt = True
                         break
                     self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
                     continue
-                if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
+
+                if self._is_stream_disconnected():
                     abrupt = True
                     break
+
                 try:
                     frame = stream.get_frame()
                 except Exception:
                     self.errors += 1
                     abrupt = True
                     break
+
                 if frame is None:
                     if no_frame_since is None:
                         no_frame_since = time.monotonic()
@@ -162,22 +193,22 @@ class CaptureWorker(threading.Thread):
                 jpeg, encode_ms = self._encode_if_changed(last_frame)
             except Exception:
                 self.errors += 1
-                jpeg, encode_ms = None, 0.0  # type: ignore[assignment]
+                jpeg, encode_ms = None, 0.0
+
             if jpeg is not None:
                 self._store.publish(jpeg, width=w or self._width, height=h or self._height, encode_ms=encode_ms, hardware=True)
                 self.frames += 1
                 store_last_publish_ts = time.monotonic()
 
-            none_since: float | None = None
             while not self._stop.is_set():
                 if not self._store.wants_capture(self._idle_timeout):
-                    none_since = None
-                    if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
+                    if self._is_stream_disconnected():
                         abrupt = True
                         break
                     self._store.wait_for_demand(self._idle_timeout, timeout=0.2)
                     continue
-                if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
+
+                if self._is_stream_disconnected():
                     abrupt = True
                     break
 
@@ -190,23 +221,10 @@ class CaptureWorker(threading.Thread):
                     break
 
                 if latest is None:
-                    # Static screen / no new damage frame from compositor.
-                    if getattr(stream, "window_invalid", False) or getattr(stream, "error", None):
-                        stall = True
-                        break
-                    if last_frame is None:
-                        if none_since is None:
-                            none_since = time.monotonic()
-                        elif time.monotonic() - none_since > NONE_STALL_S:
-                            stall = True
-                            break
-                        time.sleep(0.005)
-                        continue
-
-                    # No call to _encode_if_changed when latest is None!
+                    # Static screen: update heartbeat so valid static screens don't trigger false stalls
                     now = time.monotonic()
                     if (now - store_last_publish_ts) >= 1.0 and self._last_jpeg is not None:
-                        self._store.publish(self._last_jpeg, width=w or self._width, height=h or self._height, encode_ms=0.0, hardware=False)
+                        self._store.publish(self._last_jpeg, width=w or self._width, height=h or self._height, encode_ms=0.0, hardware=True)
                         store_last_publish_ts = now
 
                     elapsed = time.perf_counter() - loop_start
@@ -215,7 +233,6 @@ class CaptureWorker(threading.Thread):
                         self._stop.wait(sleep_time)
                     continue
 
-                none_since = None
                 last_frame = latest
                 try:
                     h, w = last_frame.shape[0], last_frame.shape[1]
@@ -245,6 +262,13 @@ class CaptureWorker(threading.Thread):
                 if sleep_time > 0:
                     self._stop.wait(sleep_time)
         finally:
+            if self._poll_fd is not None:
+                try:
+                    os.close(self._poll_fd)
+                except OSError:
+                    pass
+                self._poll_fd = None
+
             if not self._stop.is_set():
                 if abrupt:
                     self.abrupt = True
@@ -298,13 +322,11 @@ class DemoWorker(threading.Thread):
                 np.add(ys, np.uint8((n * 2) & 0xFF), out=frame[:, :, 1])
                 frame[:, :, 2].fill((n * 5) % 256)
                 try:
-                    t0 = time.perf_counter()
                     jpeg = encode_frame(frame, self._quality)
-                    encode_ms = (time.perf_counter() - t0) * 1000.0
                 except Exception:
-                    time.sleep(0.05)
+                    time.sleep(0.01)
                     continue
-                self._store.publish(jpeg, width=w, height=h, encode_ms=encode_ms, hardware=True)
+                self._store.publish(jpeg, width=w, height=h, encode_ms=1.0, hardware=True)
                 self.frames += 1
                 n += 1
                 elapsed = time.perf_counter() - loop_start
@@ -312,5 +334,5 @@ class DemoWorker(threading.Thread):
                 if sleep_time > 0:
                     self._stop.wait(sleep_time)
         finally:
-            self._store.close("sharing stopped")
+            self._store.close("demo stopped")
             self.ended.set()

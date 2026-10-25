@@ -1,8 +1,4 @@
-"""CLI: parse args, acquire screen, start encoder + HTTP server.
-
-Defaults (per spec): bind 0.0.0.0:29173 @ 24 fps. Lower-than-60fps default
-keeps CPU headroom for JPEG encode + HTTP serving.
-"""
+"""CLI: parse args, acquire screen, start encoder + HTTP server."""
 
 from __future__ import annotations
 
@@ -45,7 +41,6 @@ def _env_float(name: str, default: float) -> float:
 
 def _lan_ip() -> str | None:
     try:
-        import array
         import fcntl
         import struct
     except ImportError:
@@ -174,7 +169,6 @@ def main(argv: list[str] | None = None) -> int:
     store = FrameStore()
     worker = None
     cleanup = None
-    width = height = 0
     is_demo = bool(args.demo)
 
     def _sigterm(_signum, _frame) -> None:
@@ -195,6 +189,18 @@ def main(argv: list[str] | None = None) -> int:
                             width=args.demo_width, height=args.demo_height,
                             idle_timeout=args.idle_timeout)
         worker.start()
+
+        def _cleanup_demo() -> None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+            try:
+                worker.join(timeout=1.0)
+            except Exception:
+                pass
+
+        cleanup = _cleanup_demo
     else:
         try:
             from .portal import request_wayland_screen
@@ -209,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         loop = asyncio.new_event_loop()
         try:
             try:
-                session = loop.run_until_complete(request_wayland_screen())
+                session = loop.run_until_complete(request_wayland_screen(loop=loop))
             except Exception as e:
                 _ui.error(f"screen picker failed: {e}")
                 loop.close()
@@ -221,7 +227,12 @@ def main(argv: list[str] | None = None) -> int:
             _ui.cancelled()
             loop.close()
             return 1
-        pw_fd, node_id, width, height, bus = session
+
+        pw_fd = session.pw_fd
+        node_id = session.node_id
+        width = session.width
+        height = session.height
+
         _ui.success(f"Capturing {width}x{height} @ {args.fps:g} fps")
 
         from .capture import CaptureWorker
@@ -231,20 +242,17 @@ def main(argv: list[str] | None = None) -> int:
             stream.start()
         except Exception as e:
             _ui.error(f"could not start capture: {e}")
-            try:
-                os.close(pw_fd)
-            except OSError:
-                pass
-            bus.disconnect()
-            try:
-                loop.close()
-            except Exception:
-                pass
+            session.close()
             return 1
 
+        # Start instant listener for Portal Session Closed
+        session.start_listener(lambda: store.close("sharing stopped"))
+
         worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
-                               width=width, height=height, idle_timeout=args.idle_timeout)
+                               width=width, height=height, idle_timeout=args.idle_timeout,
+                               pw_fd=pw_fd)
         worker.start()
+
         fd_state = {"closed": False}
 
         def _close_fd_once() -> None:
@@ -261,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pass
             try:
-                worker.join(timeout=2.0)
+                worker.join(timeout=1.5)
             except Exception:
                 pass
             try:
@@ -270,19 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             _close_fd_once()
             try:
-                bus.disconnect()
-            except Exception:
-                pass
-            try:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception:
-                pass
-            try:
-                loop.close()
+                session.close()
             except Exception:
                 pass
 
@@ -298,43 +294,43 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 if store.stalled(12.0, args.idle_timeout):
                     store.close("capture stalled")
-                    break
             except Exception:
-                break
+                pass
 
-    threading.Thread(target=_stall_watch, name="visrelay-stall-watch", daemon=True).start()
-    stop_when = None if is_demo else store.is_closed
+    t = threading.Thread(target=_stall_watch, name="visrelay-stall-watch", daemon=True)
+    t.start()
+
+    def _on_ready() -> None:
+        _ui.ready(display_host, args.port)
+
     try:
-        serve_forever(store, host=args.host, port=args.port, fps=args.fps,
-                      verbose=args.verbose, stop_when=stop_when,
-                      on_ready=lambda: _ui.ready(display_host, args.port))
+        serve_forever(
+            store,
+            host=args.host,
+            port=args.port,
+            fps=args.fps,
+            verbose=args.verbose,
+            stop_when=store.is_closed,
+            on_ready=_on_ready,
+        )
     except KeyboardInterrupt:
-        _ui.stopped()
+        pass
     except OSError as e:
         _ui.error(f"cannot listen on {args.host}:{args.port}: {e}")
         return 1
     finally:
-        if cleanup is not None:
+        if cleanup:
             cleanup()
-        elif worker is not None:
-            try:
-                worker.stop()
-            except Exception:
-                pass
-            if hasattr(worker, "join"):
-                try:
-                    worker.join(timeout=2.0)
-                except Exception:
-                    pass
-        time.sleep(0.1)
 
-    if store.is_closed():
-        if store.close_reason == "capture stalled":
-            _ui.stalled()
-            return 1
-        else:
-            _ui.sharing_stopped()
-    return 0
+    if store.close_reason == "sharing stopped":
+        _ui.sharing_stopped()
+        return 0
+    elif store.close_reason == "capture stalled":
+        _ui.stalled()
+        return 1
+    else:
+        _ui.stopped()
+        return 0
 
 
 if __name__ == "__main__":

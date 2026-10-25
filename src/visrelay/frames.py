@@ -79,17 +79,15 @@ class FrameStore:
                 fid = self._frame_id
                 ts = self._timestamp
                 closed = self._closed
-                active = self._wants_locked(idle_timeout=0)
+
             if closed:
-                return jpeg
-            if jpeg is not None and active:
                 return jpeg
             if jpeg is not None and (time.monotonic() - ts) <= max_age:
                 return jpeg
             jpeg2, fid2, _ = self.wait_for(fid, timeout=timeout)
             if fid2 != fid and jpeg2 is not None:
                 return jpeg2
-            return None
+            return jpeg
         finally:
             self.viewer_close()
 
