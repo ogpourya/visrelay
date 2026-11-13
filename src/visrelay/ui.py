@@ -183,3 +183,86 @@ class Spinner:
         elif self._tty and not clear:
             sys.stdout.write("\n")
             sys.stdout.flush()
+
+
+def select(prompt: str, options: list[str], default: int = 0) -> int | None:
+    """Inline Bubble Tea-style single-choice picker. Returns index or None if cancelled."""
+    if not options:
+        return None
+    idx = max(0, min(default, len(options) - 1))
+    if not supports_color():
+        print(f"{cyan('?')} {prompt}", flush=True)
+        for i, opt in enumerate(options, 1):
+            print(f"  {i}. {opt}", flush=True)
+        try:
+            raw = input("Enter number (or q to cancel): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if raw in ("", "q", "esc"):
+            return idx if raw == "" else None
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        return None
+
+    import select as _select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    total_lines = len(options) + 1
+
+    def _render(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\x1b[{total_lines}A")
+        lines = [f"\r\x1b[K{cyan('?')} {bold(prompt)} {dim('(↑/↓, 1-9, Enter, Esc)')}"]
+        for i, opt in enumerate(options):
+            num = f"{i + 1}."
+            if i == idx:
+                lines.append(f"\r\x1b[K  {cyan('❯')} {bold(num)} {bold(opt)}")
+            else:
+                lines.append(f"\r\x1b[K    {dim(num)} {opt}")
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+
+    sys.stdout.write("\x1b[?25l")
+    _render(first=True)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch:
+                return None
+            if ch in (b"\r", b"\n"):
+                return idx
+            if ch in (b"\x03", b"q", b"Q"):
+                return None
+            if ch == b"\x1b":
+                r, _, _ = _select.select([fd], [], [], 0.03)
+                if not r:
+                    return None
+                seq = os.read(fd, 2)
+                if seq in (b"[A", b"OA"):
+                    idx = (idx - 1) % len(options)
+                    _render()
+                elif seq in (b"[B", b"OB"):
+                    idx = (idx + 1) % len(options)
+                    _render()
+                continue
+            if ch in (b"k", b"K"):
+                idx = (idx - 1) % len(options)
+                _render()
+            elif ch in (b"j", b"J"):
+                idx = (idx + 1) % len(options)
+                _render()
+            elif b"1" <= ch <= b"9":
+                picked = ch[0] - ord("1")
+                if picked < len(options):
+                    return picked
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        sys.stdout.write(f"\x1b[{total_lines}A")
+        for _ in range(total_lines):
+            sys.stdout.write("\r\x1b[K\n")
+        sys.stdout.write(f"\x1b[{total_lines}A\x1b[?25h")
+        sys.stdout.flush()

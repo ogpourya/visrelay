@@ -136,8 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Keep capturing N seconds after the last viewer leaves (default 5; 0 = pause immediately)")
     p.add_argument("--quality", type=int, default=_env_int("VISRELAY_QUALITY", DEFAULT_QUALITY),
                    help=f"JPEG quality 1-100 (default {DEFAULT_QUALITY}; lower = faster/smaller)")
-    p.add_argument("--monitor", type=int, default=_env_int("VISRELAY_MONITOR", 0),
-                   help="X11 monitor index (default 0 = full screen, 1+ = specific monitor)")
+    raw_mon = os.environ.get("VISRELAY_MONITOR", "").strip()
+    default_mon = int(raw_mon) if raw_mon.isdigit() else None
+    p.add_argument("--monitor", type=int, default=default_mon,
+                   help="X11 monitor index (1+ = specific monitor, 0 = all monitors; prompts if omitted)")
     p.add_argument("--demo", action="store_true",
                    help="Serve a synthetic test pattern (no display needed)")
     p.add_argument("--demo-width", type=int, default=640)
@@ -178,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (16 <= args.demo_height <= 7680):
         _ui.error("visrelay: error: --demo-height must be 16-7680")
         return 2
-    if args.monitor < 0:
+    if args.monitor is not None and args.monitor < 0:
         _ui.error("visrelay: error: --monitor must be >= 0")
         return 2
 
@@ -225,16 +227,39 @@ def main(argv: list[str] | None = None) -> int:
 
         if backend == "x11":
             from .capture import CaptureWorker
-            from .x11 import X11Stream
+            from .x11 import X11Stream, list_monitors
 
-            stream = X11Stream(monitor=args.monitor)
+            monitor = args.monitor
+            if monitor is None:
+                try:
+                    monitors, all_mon = list_monitors()
+                except Exception as e:
+                    _ui.error(f"could not query X11 monitors: {e}")
+                    return 1
+                primary_idx = next((i for i, m in enumerate(monitors) if m.primary), 0)
+                if len(monitors) == 1:
+                    monitor = monitors[0].index
+                elif sys.stdin.isatty() and sys.stdout.isatty():
+                    choices = [
+                        f"{m.name} ({m.width}x{m.height}{', primary' if m.primary else ''})"
+                        for m in monitors
+                    ] + [f"{all_mon.name} ({all_mon.width}x{all_mon.height})"]
+                    picked = _ui.select("Select a screen to share:", choices, default=primary_idx)
+                    if picked is None:
+                        _ui.cancelled()
+                        return 1
+                    monitor = monitors[picked].index if picked < len(monitors) else 0
+                else:
+                    monitor = monitors[primary_idx].index
+
+            stream = X11Stream(monitor=monitor)
             try:
                 stream.start()
             except Exception as e:
                 _ui.error(f"could not start X11 capture: {e}")
                 return 1
 
-            _ui.success(f"Capturing X11 {stream.width}x{stream.height} @ {args.fps:g} fps")
+            _ui.success(f"Capturing X11 {stream.monitor_name} ({stream.width}x{stream.height}) @ {args.fps:g} fps")
 
             worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
                                    width=stream.width, height=stream.height,

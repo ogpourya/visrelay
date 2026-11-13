@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+from dataclasses import dataclass
 import os
 import select
 import threading
@@ -24,7 +25,19 @@ IPC_RMID = 0
 _c_ulong = ctypes.c_ulong
 _c_int = ctypes.c_int
 _c_uint = ctypes.c_uint
+_c_ushort = ctypes.c_ushort
 _c_void_p = ctypes.c_void_p
+
+
+@dataclass(frozen=True)
+class X11Monitor:
+    index: int  # 1-based monitor index; 0 = combined virtual screen
+    name: str
+    x: int
+    y: int
+    width: int
+    height: int
+    primary: bool = False
 
 
 class _XShmSegmentInfo(ctypes.Structure):
@@ -97,12 +110,32 @@ class _XRRCrtcInfo(ctypes.Structure):
         ("width", _c_uint),
         ("height", _c_uint),
         ("mode", _c_ulong),
-        ("rotation", ctypes.c_ushort),
+        ("rotation", _c_ushort),
         ("noutput", _c_int),
         ("outputs", ctypes.POINTER(_c_ulong)),
-        ("rotations", ctypes.c_ushort),
+        ("rotations", _c_ushort),
         ("npossible", _c_int),
         ("possible", ctypes.POINTER(_c_ulong)),
+    ]
+
+
+class _XRROutputInfo(ctypes.Structure):
+    _fields_ = [
+        ("timestamp", _c_ulong),
+        ("crtc", _c_ulong),
+        ("name", ctypes.c_char_p),
+        ("nameLen", _c_int),
+        ("mm_width", _c_ulong),
+        ("mm_height", _c_ulong),
+        ("connection", _c_ushort),
+        ("subpixel_order", _c_ushort),
+        ("ncrtc", _c_int),
+        ("crtcs", ctypes.POINTER(_c_ulong)),
+        ("nclone", _c_int),
+        ("clones", ctypes.POINTER(_c_ulong)),
+        ("nmode", _c_int),
+        ("npreferred", _c_int),
+        ("modes", ctypes.POINTER(_c_ulong)),
     ]
 
 
@@ -115,8 +148,6 @@ _last_x11_error = 0
 @_ERROR_HANDLER_TYPE
 def _x11_error_handler(_dpy: int, event_ptr: int) -> int:
     global _last_x11_error
-    # XErrorEvent layout: int type (0), Display *display (8), XID resourceid (16),
-    # unsigned long serial (24), unsigned char error_code (32)
     try:
         err_code = ctypes.c_ubyte.from_address(event_ptr + 32).value
         _last_x11_error = int(err_code)
@@ -209,13 +240,11 @@ def _bind_libs():
     return libc, x11, xext, xdamage
 
 
-def _resolve_monitor(dpy: int, root: int, screen: int, x11: ctypes.CDLL, monitor: int) -> tuple[int, int, int, int]:
-    full_w = int(x11.XDisplayWidth(dpy, screen))
-    full_h = int(x11.XDisplayHeight(dpy, screen))
-    if monitor == 0:
-        return 0, 0, full_w, full_h
-
-    xrandr = _load_lib("Xrandr", "libXrandr.so.2")
+def _bind_xrandr() -> ctypes.CDLL | None:
+    try:
+        xrandr = _load_lib("Xrandr", "libXrandr.so.2")
+    except RuntimeError:
+        return None
     xrandr.XRRGetScreenResourcesCurrent.argtypes = [_c_void_p, _c_ulong]
     xrandr.XRRGetScreenResourcesCurrent.restype = ctypes.POINTER(_XRRScreenResources)
     xrandr.XRRFreeScreenResources.argtypes = [ctypes.POINTER(_XRRScreenResources)]
@@ -224,39 +253,121 @@ def _resolve_monitor(dpy: int, root: int, screen: int, x11: ctypes.CDLL, monitor
     xrandr.XRRGetCrtcInfo.restype = ctypes.POINTER(_XRRCrtcInfo)
     xrandr.XRRFreeCrtcInfo.argtypes = [ctypes.POINTER(_XRRCrtcInfo)]
     xrandr.XRRFreeCrtcInfo.restype = None
+    xrandr.XRRGetOutputInfo.argtypes = [_c_void_p, ctypes.POINTER(_XRRScreenResources), _c_ulong]
+    xrandr.XRRGetOutputInfo.restype = ctypes.POINTER(_XRROutputInfo)
+    xrandr.XRRFreeOutputInfo.argtypes = [ctypes.POINTER(_XRROutputInfo)]
+    xrandr.XRRFreeOutputInfo.restype = None
+    xrandr.XRRGetOutputPrimary.argtypes = [_c_void_p, _c_ulong]
+    xrandr.XRRGetOutputPrimary.restype = _c_ulong
+    return xrandr
+
+
+def _query_monitors(dpy: int, root: int, screen: int, x11: ctypes.CDLL) -> tuple[list[X11Monitor], X11Monitor]:
+    full_w = int(x11.XDisplayWidth(dpy, screen))
+    full_h = int(x11.XDisplayHeight(dpy, screen))
+    all_mon = X11Monitor(index=0, name="All monitors", x=0, y=0, width=full_w, height=full_h, primary=False)
+
+    xrandr = _bind_xrandr()
+    if xrandr is None:
+        return [X11Monitor(index=1, name="Screen 0", x=0, y=0, width=full_w, height=full_h, primary=True)], all_mon
 
     res = xrandr.XRRGetScreenResourcesCurrent(dpy, root)
     if not res:
-        raise RuntimeError("XRandR screen resources unavailable")
+        return [X11Monitor(index=1, name="Screen 0", x=0, y=0, width=full_w, height=full_h, primary=True)], all_mon
+
     try:
-        rects: list[tuple[int, int, int, int]] = []
-        for i in range(res.contents.ncrtc):
-            info = xrandr.XRRGetCrtcInfo(dpy, res, res.contents.crtcs[i])
-            if not info:
+        primary_out = int(xrandr.XRRGetOutputPrimary(dpy, root))
+        crtc_meta: dict[int, tuple[str, bool]] = {}
+        for i in range(res.contents.noutput):
+            out_id = int(res.contents.outputs[i])
+            oinfo = xrandr.XRRGetOutputInfo(dpy, res, out_id)
+            if not oinfo:
                 continue
             try:
-                if info.contents.mode != 0 and info.contents.width > 0 and info.contents.height > 0:
-                    rects.append((
-                        int(info.contents.x),
-                        int(info.contents.y),
-                        int(info.contents.width),
-                        int(info.contents.height),
+                crtc_id = int(oinfo.contents.crtc)
+                if crtc_id != 0:
+                    raw_name = oinfo.contents.name or b""
+                    name = raw_name.decode("utf-8", errors="replace") or f"Output-{i + 1}"
+                    is_prim = out_id == primary_out
+                    prev = crtc_meta.get(crtc_id)
+                    if prev is None or is_prim:
+                        crtc_meta[crtc_id] = (name, is_prim or (prev[1] if prev else False))
+            finally:
+                xrandr.XRRFreeOutputInfo(oinfo)
+
+        raw_mons: list[tuple[int, int, int, int, str, bool]] = []
+        for i in range(res.contents.ncrtc):
+            crtc_id = int(res.contents.crtcs[i])
+            cinfo = xrandr.XRRGetCrtcInfo(dpy, res, crtc_id)
+            if not cinfo:
+                continue
+            try:
+                if cinfo.contents.mode != 0 and cinfo.contents.width > 0 and cinfo.contents.height > 0:
+                    name, is_prim = crtc_meta.get(crtc_id, (f"Display-{len(raw_mons) + 1}", False))
+                    raw_mons.append((
+                        int(cinfo.contents.x),
+                        int(cinfo.contents.y),
+                        int(cinfo.contents.width),
+                        int(cinfo.contents.height),
+                        name,
+                        is_prim,
                     ))
             finally:
-                xrandr.XRRFreeCrtcInfo(info)
+                xrandr.XRRFreeCrtcInfo(cinfo)
     finally:
         xrandr.XRRFreeScreenResources(res)
 
-    rects.sort(key=lambda r: (r[0], r[1]))
-    if not (1 <= monitor <= len(rects)):
-        raise RuntimeError(f"monitor {monitor} out of range (found {len(rects)} active monitor(s); use 0 for all)")
-    return rects[monitor - 1]
+    if not raw_mons:
+        return [X11Monitor(index=1, name="Screen 0", x=0, y=0, width=full_w, height=full_h, primary=True)], all_mon
+
+    raw_mons.sort(key=lambda r: (r[0], r[1]))
+    if not any(m[5] for m in raw_mons):
+        x0, y0, w0, h0, n0, _ = raw_mons[0]
+        raw_mons[0] = (x0, y0, w0, h0, n0, True)
+
+    monitors = [
+        X11Monitor(index=idx + 1, name=name, x=x, y=y, width=w, height=h, primary=is_prim)
+        for idx, (x, y, w, h, name, is_prim) in enumerate(raw_mons)
+    ]
+    return monitors, all_mon
+
+
+def list_monitors(display: str | None = None) -> tuple[list[X11Monitor], X11Monitor]:
+    """Query active X11 monitors and the combined full-screen geometry."""
+    x11 = _load_lib("X11", "libX11.so.6")
+    x11.XInitThreads.argtypes = []
+    x11.XInitThreads.restype = _c_int
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = _c_void_p
+    x11.XCloseDisplay.argtypes = [_c_void_p]
+    x11.XCloseDisplay.restype = _c_int
+    x11.XDefaultScreen.argtypes = [_c_void_p]
+    x11.XDefaultScreen.restype = _c_int
+    x11.XRootWindow.argtypes = [_c_void_p, _c_int]
+    x11.XRootWindow.restype = _c_ulong
+    x11.XDisplayWidth.argtypes = [_c_void_p, _c_int]
+    x11.XDisplayWidth.restype = _c_int
+    x11.XDisplayHeight.argtypes = [_c_void_p, _c_int]
+    x11.XDisplayHeight.restype = _c_int
+
+    x11.XInitThreads()
+    disp_b = display.encode("utf-8") if display else None
+    dpy = x11.XOpenDisplay(disp_b)
+    if not dpy:
+        disp = display or os.environ.get("DISPLAY", "<unset>")
+        raise RuntimeError(f"cannot open X11 display ({disp})")
+    try:
+        screen = x11.XDefaultScreen(dpy)
+        root = x11.XRootWindow(dpy, screen)
+        return _query_monitors(dpy, root, screen, x11)
+    finally:
+        x11.XCloseDisplay(dpy)
 
 
 class X11Stream:
     """Zero-copy XShm screen stream gated by XDamage events."""
 
-    def __init__(self, display: str | None = None, monitor: int = 0) -> None:
+    def __init__(self, display: str | None = None, monitor: int = 1) -> None:
         self._display_name = display.encode("utf-8") if display else None
         self._monitor = monitor
         self._lock = threading.Lock()
@@ -276,6 +387,7 @@ class X11Stream:
         self._arr: np.ndarray | None = None
         self._first_frame = True
         self._closed = False
+        self.monitor_name = ""
         self.x = 0
         self.y = 0
         self.width = 0
@@ -318,7 +430,17 @@ class X11Stream:
                 if not xdamage.XDamageQueryExtension(dpy, ctypes.byref(ev_base), ctypes.byref(err_base)):
                     raise RuntimeError("X11 XDamage extension unavailable")
 
-                x, y, w, h = _resolve_monitor(dpy, root, screen, x11, self._monitor)
+                monitors, all_mon = _query_monitors(dpy, root, screen, x11)
+                if self._monitor == 0:
+                    target = all_mon
+                elif 1 <= self._monitor <= len(monitors):
+                    target = monitors[self._monitor - 1]
+                else:
+                    raise RuntimeError(
+                        f"monitor {self._monitor} out of range (found {len(monitors)} active monitor(s); use 0 for all)"
+                    )
+
+                x, y, w, h = target.x, target.y, target.width, target.height
                 if w <= 0 or h <= 0:
                     raise RuntimeError(f"invalid X11 capture dimensions {w}x{h}")
 
@@ -340,7 +462,6 @@ class X11Stream:
                 shminfo.shmid = shmid
 
                 addr = libc.shmat(shmid, None, 0)
-                # (void *)-1 indicates shmat error
                 if not addr or addr == ctypes.c_void_p(-1).value:
                     libc.shmctl(shmid, IPC_RMID, None)
                     raise RuntimeError("shmat failed")
@@ -364,7 +485,8 @@ class X11Stream:
 
                 self._root = root
                 self._damage = damage
-                self._damage_event_type = int(ev_base.value)  # XDamageNotify == ev_base + 0
+                self._damage_event_type = int(ev_base.value)
+                self.monitor_name = target.name
                 self.x = x
                 self.y = y
                 self.width = w
@@ -429,7 +551,6 @@ class X11Stream:
             if not damaged:
                 return None
 
-            # Clear damage BEFORE reading pixels so updates during read trigger a new event
             self._xdamage.XDamageSubtract(dpy, self._damage, 0, 0)
             ok = self._xext.XShmGetImage(
                 dpy, self._root, self._ximg, self.x, self.y, ALL_PLANES
