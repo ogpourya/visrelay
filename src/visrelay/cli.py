@@ -87,6 +87,17 @@ def _lan_ip() -> str | None:
         s.close()
 
 
+def _select_backend() -> str:
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    if session_type == "x11":
+        return "x11"
+    if os.environ.get("WAYLAND_DISPLAY") or session_type == "wayland":
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "none"
+
+
 def _display_host(bind_host: str) -> str:
     if bind_host not in ("0.0.0.0", "::", "", "0:0:0:0:0:0:0:0"):
         return bind_host
@@ -125,8 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Keep capturing N seconds after the last viewer leaves (default 5; 0 = pause immediately)")
     p.add_argument("--quality", type=int, default=_env_int("VISRELAY_QUALITY", DEFAULT_QUALITY),
                    help=f"JPEG quality 1-100 (default {DEFAULT_QUALITY}; lower = faster/smaller)")
+    p.add_argument("--monitor", type=int, default=_env_int("VISRELAY_MONITOR", 0),
+                   help="X11 monitor index (default 0 = full screen, 1+ = specific monitor)")
     p.add_argument("--demo", action="store_true",
-                   help="Serve a synthetic test pattern (no Wayland/portal needed)")
+                   help="Serve a synthetic test pattern (no display needed)")
     p.add_argument("--demo-width", type=int, default=640)
     p.add_argument("--demo-height", type=int, default=360)
     p.add_argument("-v", "--verbose", action="store_true", help="Log HTTP requests")
@@ -165,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     if not (16 <= args.demo_height <= 7680):
         _ui.error("visrelay: error: --demo-height must be 16-7680")
         return 2
+    if args.monitor < 0:
+        _ui.error("visrelay: error: --monitor must be >= 0")
+        return 2
 
     store = FrameStore()
     worker = None
@@ -202,87 +218,126 @@ def main(argv: list[str] | None = None) -> int:
 
         cleanup = _cleanup_demo
     else:
-        try:
-            from .portal import request_wayland_screen
-            from pipewire_capture import CaptureStream
-        except ImportError as e:
-            _ui.error(f"missing dependency: {e}\n  install with: uv sync\n"
-                      "  try `visrelay --demo` without Wayland.")
+        backend = _select_backend()
+        if backend == "none":
+            _ui.error("no display found (set WAYLAND_DISPLAY or DISPLAY, or try `visrelay --demo`).")
             return 1
 
-        spin = _ui.Spinner("Select a screen or window in the system dialog...")
-        spin.start()
-        loop = asyncio.new_event_loop()
-        try:
+        if backend == "x11":
+            from .capture import CaptureWorker
+            from .x11 import X11Stream
+
+            stream = X11Stream(monitor=args.monitor)
             try:
-                session = loop.run_until_complete(request_wayland_screen(loop=loop))
+                stream.start()
             except Exception as e:
-                _ui.error(f"screen picker failed: {e}")
-                loop.close()
+                _ui.error(f"could not start X11 capture: {e}")
                 return 1
-        finally:
-            spin.stop(clear=True)
 
-        if session is None:
-            _ui.cancelled()
-            loop.close()
-            return 1
+            _ui.success(f"Capturing X11 {stream.width}x{stream.height} @ {args.fps:g} fps")
 
-        pw_fd = session.pw_fd
-        node_id = session.node_id
-        width = session.width
-        height = session.height
+            worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
+                                   width=stream.width, height=stream.height,
+                                   idle_timeout=args.idle_timeout)
+            worker.start()
 
-        _ui.success(f"Capturing {width}x{height} @ {args.fps:g} fps")
-
-        from .capture import CaptureWorker
-
-        stream = CaptureStream(pw_fd, node_id, width, height, capture_interval=0.0)
-        try:
-            stream.start()
-        except Exception as e:
-            _ui.error(f"could not start capture: {e}")
-            session.close()
-            return 1
-
-        # Start instant listener for Portal Session Closed
-        session.start_listener(lambda: store.close("sharing stopped"))
-
-        worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
-                               width=width, height=height, idle_timeout=args.idle_timeout,
-                               pw_fd=pw_fd)
-        worker.start()
-
-        fd_state = {"closed": False}
-
-        def _close_fd_once() -> None:
-            if not fd_state["closed"]:
-                fd_state["closed"] = True
+            def _cleanup_x11() -> None:
                 try:
-                    os.close(pw_fd)
-                except OSError:
+                    worker.stop()
+                except Exception:
+                    pass
+                try:
+                    worker.join(timeout=1.5)
+                except Exception:
+                    pass
+                try:
+                    stream.stop()
+                except Exception:
                     pass
 
-        def _cleanup() -> None:
+            cleanup = _cleanup_x11
+        else:
             try:
-                worker.stop()
-            except Exception:
-                pass
-            try:
-                worker.join(timeout=1.5)
-            except Exception:
-                pass
-            try:
-                stream.stop()
-            except Exception:
-                pass
-            _close_fd_once()
-            try:
-                session.close()
-            except Exception:
-                pass
+                from .portal import request_wayland_screen
+                from pipewire_capture import CaptureStream
+            except ImportError as e:
+                _ui.error(f"missing dependency: {e}\n  install with: uv sync\n"
+                          "  try `visrelay --demo` without Wayland.")
+                return 1
 
-        cleanup = _cleanup
+            spin = _ui.Spinner("Select a screen or window in the system dialog...")
+            spin.start()
+            loop = asyncio.new_event_loop()
+            try:
+                try:
+                    session = loop.run_until_complete(request_wayland_screen(loop=loop))
+                except Exception as e:
+                    _ui.error(f"screen picker failed: {e}")
+                    loop.close()
+                    return 1
+            finally:
+                spin.stop(clear=True)
+
+            if session is None:
+                _ui.cancelled()
+                loop.close()
+                return 1
+
+            pw_fd = session.pw_fd
+            node_id = session.node_id
+            width = session.width
+            height = session.height
+
+            _ui.success(f"Capturing {width}x{height} @ {args.fps:g} fps")
+
+            from .capture import CaptureWorker
+
+            stream = CaptureStream(pw_fd, node_id, width, height, capture_interval=0.0)
+            try:
+                stream.start()
+            except Exception as e:
+                _ui.error(f"could not start capture: {e}")
+                session.close()
+                return 1
+
+            # Start instant listener for Portal Session Closed
+            session.start_listener(lambda: store.close("sharing stopped"))
+
+            worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
+                                   width=width, height=height, idle_timeout=args.idle_timeout,
+                                   pw_fd=pw_fd)
+            worker.start()
+
+            fd_state = {"closed": False}
+
+            def _close_fd_once() -> None:
+                if not fd_state["closed"]:
+                    fd_state["closed"] = True
+                    try:
+                        os.close(pw_fd)
+                    except OSError:
+                        pass
+
+            def _cleanup() -> None:
+                try:
+                    worker.stop()
+                except Exception:
+                    pass
+                try:
+                    worker.join(timeout=1.5)
+                except Exception:
+                    pass
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                _close_fd_once()
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+            cleanup = _cleanup
 
     from .server import serve_forever
 

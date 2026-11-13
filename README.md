@@ -11,7 +11,7 @@ Streams the selected screen or application to an HTTP address.
 
 ## Supported platforms
 
-Ubuntu Desktop (Wayland) for now. Requires desktop portal + PipeWire; approve the system picker when prompted. `visrelay --demo` runs anywhere without Wayland.
+Linux Desktop: Wayland (desktop portal + PipeWire; approve the system picker when prompted) and X11 (XFCE, etc. via XShm + XDamage; `--monitor N` selects monitor `1+` or `0` for all). `visrelay --demo` runs anywhere without a display.
 
 ## Install
 

@@ -1,7 +1,7 @@
 [project]
 name = "visrelay"
 version = "0.2.0"
-description = "Stream the selected Wayland screen/window to HTTP (MJPEG + snapshot)"
+description = "Stream the selected Wayland or X11 screen/window to HTTP (MJPEG + snapshot)"
 readme = "README.md"
 authors = [
     { name = "POURYA", email = "ogpourya@gmail.com" }

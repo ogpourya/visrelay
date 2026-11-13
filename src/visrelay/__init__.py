@@ -1,4 +1,4 @@
-"""visrelay: Wayland screen -> HTTP MJPEG relay.
+"""visrelay: Wayland / X11 screen -> HTTP MJPEG relay.
 
 Defaults: bind 0.0.0.0:29173 @ 24 fps (paced to leave CPU for HTTP serving).
 """
