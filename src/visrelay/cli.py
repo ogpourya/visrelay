@@ -98,6 +98,24 @@ def _select_backend() -> str:
     return "none"
 
 
+def _resolve_window(spec: str, windows: list) -> object | None:
+    q = spec.strip()
+    if not q:
+        return None
+    try:
+        wid = int(q, 0)
+        for w in windows:
+            if w.wid == wid:
+                return w
+    except ValueError:
+        pass
+    ql = q.lower()
+    for w in windows:
+        if ql in w.title.lower() or (w.app and ql in w.app.lower()):
+            return w
+    return None
+
+
 def _display_host(bind_host: str) -> str:
     if bind_host not in ("0.0.0.0", "::", "", "0:0:0:0:0:0:0:0"):
         return bind_host
@@ -140,6 +158,9 @@ def build_parser() -> argparse.ArgumentParser:
     default_mon = int(raw_mon) if raw_mon.isdigit() else None
     p.add_argument("--monitor", type=int, default=default_mon,
                    help="X11 monitor index (1+ = specific monitor, 0 = all monitors; prompts if omitted)")
+    raw_win = os.environ.get("VISRELAY_WINDOW", "").strip() or None
+    p.add_argument("--window", default=raw_win,
+                   help="X11 window ID (e.g. 0x3a00007) or title substring to stream")
     p.add_argument("--demo", action="store_true",
                    help="Serve a synthetic test pattern (no display needed)")
     p.add_argument("--demo-width", type=int, default=640)
@@ -182,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.monitor is not None and args.monitor < 0:
         _ui.error("visrelay: error: --monitor must be >= 0")
+        return 2
+    if args.monitor is not None and args.window is not None:
+        _ui.error("visrelay: error: --monitor and --window cannot be used together")
         return 2
 
     store = FrameStore()
@@ -227,39 +251,84 @@ def main(argv: list[str] | None = None) -> int:
 
         if backend == "x11":
             from .capture import CaptureWorker
-            from .x11 import X11Stream, list_monitors
+            from .x11 import X11Stream, list_monitors, list_windows
 
             monitor = args.monitor
-            if monitor is None:
+            window_id: int | None = None
+
+            if args.window is not None:
+                try:
+                    windows = list_windows()
+                except Exception as e:
+                    _ui.error(f"could not query X11 windows: {e}")
+                    return 1
+                matched = _resolve_window(args.window, windows)
+                if matched is not None:
+                    window_id = matched.wid
+                else:
+                    try:
+                        window_id = int(args.window.strip(), 0)
+                    except ValueError:
+                        _ui.error(f"no matching X11 window found: {args.window}")
+                        return 1
+            elif monitor is None:
                 try:
                     monitors, all_mon = list_monitors()
                 except Exception as e:
                     _ui.error(f"could not query X11 monitors: {e}")
                     return 1
+                try:
+                    windows = list_windows()
+                except Exception:
+                    windows = []
                 primary_idx = next((i for i, m in enumerate(monitors) if m.primary), 0)
-                if len(monitors) == 1:
-                    monitor = monitors[0].index
-                elif sys.stdin.isatty() and sys.stdout.isatty():
-                    choices = [
-                        f"{m.name} ({m.width}x{m.height}{', primary' if m.primary else ''})"
-                        for m in monitors
-                    ] + [f"{all_mon.name} ({all_mon.width}x{all_mon.height})"]
-                    picked = _ui.select("Select a screen to share:", choices, default=primary_idx)
+                if sys.stdin.isatty() and sys.stdout.isatty() and (len(monitors) > 1 or len(windows) > 0):
+                    choices: list[str] = []
+                    targets: list[tuple[str, int]] = []
+                    if len(monitors) == 1:
+                        m = monitors[0]
+                        choices.append(f"Screen: {m.name} ({m.width}x{m.height})")
+                        targets.append(("monitor", m.index))
+                    else:
+                        for m in monitors:
+                            choices.append(
+                                f"Screen: {m.name} ({m.width}x{m.height}{', primary' if m.primary else ''})"
+                            )
+                            targets.append(("monitor", m.index))
+                        choices.append(f"Screen: {all_mon.name} ({all_mon.width}x{all_mon.height})")
+                        targets.append(("monitor", 0))
+                    for w in windows:
+                        label = (
+                            f"{w.app} - {w.title}"
+                            if w.app and w.app.lower() not in w.title.lower()
+                            else w.title
+                        )
+                        choices.append(f"Window: {label} ({w.width}x{w.height})")
+                        targets.append(("window", w.wid))
+
+                    picked = _ui.select("Select a screen or window to share:", choices, default=primary_idx)
                     if picked is None:
                         _ui.cancelled()
                         return 1
-                    monitor = monitors[picked].index if picked < len(monitors) else 0
+                    kind, val = targets[picked]
+                    if kind == "monitor":
+                        monitor = val
+                    else:
+                        window_id = val
                 else:
                     monitor = monitors[primary_idx].index
 
-            stream = X11Stream(monitor=monitor)
+            stream = X11Stream(window=window_id) if window_id is not None else X11Stream(monitor=monitor)
             try:
                 stream.start()
             except Exception as e:
                 _ui.error(f"could not start X11 capture: {e}")
                 return 1
 
-            _ui.success(f"Capturing X11 {stream.monitor_name} ({stream.width}x{stream.height}) @ {args.fps:g} fps")
+            if window_id is not None:
+                _ui.success(f"Capturing X11 window {stream.target_name} ({stream.width}x{stream.height}) @ {args.fps:g} fps")
+            else:
+                _ui.success(f"Capturing X11 {stream.target_name} ({stream.width}x{stream.height}) @ {args.fps:g} fps")
 
             worker = CaptureWorker(stream, store, fps=args.fps, quality=args.quality,
                                    width=stream.width, height=stream.height,

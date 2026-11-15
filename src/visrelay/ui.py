@@ -205,6 +205,7 @@ def select(prompt: str, options: list[str], default: int = 0) -> int | None:
         return None
 
     import select as _select
+    import shutil
     import termios
     import tty
 
@@ -215,13 +216,16 @@ def select(prompt: str, options: list[str], default: int = 0) -> int | None:
     def _render(first: bool = False) -> None:
         if not first:
             sys.stdout.write(f"\x1b[{total_lines}A")
+        cols = shutil.get_terminal_size((80, 24)).columns
+        max_opt = max(20, cols - 10)
         lines = [f"\r\x1b[K{cyan('?')} {bold(prompt)} {dim('(↑/↓, 1-9, Enter, Esc)')}"]
         for i, opt in enumerate(options):
+            shown = opt if len(opt) <= max_opt else opt[: max_opt - 3] + "..."
             num = f"{i + 1}."
             if i == idx:
-                lines.append(f"\r\x1b[K  {cyan('❯')} {bold(num)} {bold(opt)}")
+                lines.append(f"\r\x1b[K  {cyan('❯')} {bold(num)} {bold(shown)}")
             else:
-                lines.append(f"\r\x1b[K    {dim(num)} {opt}")
+                lines.append(f"\r\x1b[K    {dim(num)} {shown}")
         sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
 
